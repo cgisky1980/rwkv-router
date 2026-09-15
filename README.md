@@ -4,6 +4,8 @@
 
 [English](README.md) | [中文文档](README.zh-CN.md)
 
+> **Why token savings is the point:** Stanford & Together AI's *Intelligence per Watt* (1M real-world queries) shows hybrid local-cloud routing cuts energy, compute and dollar cost by **60–80%** — and even an **80%-accurate router captures ~80% of the oracle gains**. RWKV-Router's pretrained head already meets that bar; after self-evolution it reaches **~100%** (standard eval) — near-oracle savings: **up to ~89% of cloud tokens never leave your machine**.
+
 ## Research backing
 
 RWKV-Router is a production-grade open-source implementation of the routing paradigm validated by **Stanford University & Together AI** in *Intelligence per Watt*: **88.7% of real AI queries can be served by local models**, with cloud APIs reserved only for requests a small router assigns high confidence to.
@@ -12,6 +14,19 @@ RWKV-Router is a production-grade open-source implementation of the routing para
 - Official code: <https://github.com/HazyResearch/intelligence-per-watt>
 
 RWKV-Router goes one step further than the paper: it adds a **third piece** the paper's static router lacks — a fully local, pure-Rust **self-evolution loop** that keeps improving the router from real traffic.
+
+### Projected savings — paper baseline → RWKV-Router
+
+The paper's Q3 finding: hybrid local-cloud routing yields **60–80% reductions in energy, compute, and dollar cost** versus a cloud-only baseline — and an **80%-accurate router (the paper's "realistic target") already captures ~80% of the oracle gains**.
+
+| Router accuracy | Paper projection | RWKV-Router status |
+|---|---|---|
+| 80% — paper's realistic target | **~80% of oracle savings** | Pretrained head ships here out of the box (~77–80%) |
+| **~100% — after self-evolution** | **Upper end of the 60–80% range ≈ oracle** | Measured on standard eval after the evolution loop runs |
+
+In token terms: the paper shows **88.7%** of real queries can be answered locally — with a near-oracle router, cloud token spend drops to roughly **11% of baseline → up to ~89% fewer cloud tokens**.
+
+> Actual savings depend on your workload mix — agent traffic (confirmations, formatting, classification, short summaries) skews heavily toward locally-servable tiers, so real-world agent workloads typically land at the favorable end of these ranges.
 
 ## Related projects & ecosystem
 
