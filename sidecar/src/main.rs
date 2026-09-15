@@ -8,6 +8,7 @@
 
 mod api;
 mod config;
+mod download;
 mod mcp;
 mod proxy;
 mod state;
@@ -70,6 +71,16 @@ enum Command {
     Evolve {
         #[arg(long)]
         config: Option<String>,
+    },
+    /// Download the model bundle (0.1B classifier + vocab + pretrained head)
+    /// from ModelScope / HF (hf-mirror fallback) into --dir.
+    Fetch {
+        /// Target directory (default: ./models).
+        #[arg(long, default_value = "models")]
+        dir: String,
+        /// Also download a tier generation model: "3b" or "7b".
+        #[arg(long)]
+        tier_models: Option<String>,
     },
 }
 
@@ -181,6 +192,9 @@ fn main() {
         Command::Stats { config } => run_stats(config),
         Command::Label { idx, tier, config } => run_label(idx, tier, config),
         Command::Evolve { config } => run_evolve(config),
+        Command::Fetch { dir, tier_models } => {
+            download::run(std::path::Path::new(&dir), tier_models.as_deref())
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

@@ -41,9 +41,15 @@ Codex CLI / Claude Code / Cursor / 任何 OpenAI SDK
 # 构建（Rust，--release 必须）
 cargo build --release -p rwkv-router-sidecar
 
-# 准备配置
+# 一条命令下载模型包：0.1B 分类骨干(int8) + tokenizer + 预训练自进化头
+# （ModelScope 优先，hf-mirror / HF 自动回退；默认落 ./models/）
+./target/release/rwkv-router fetch
+# 可选：同时下载层级生成模型（R2/R3 本地生成用，3GB/7.5GB）
+./target/release/rwkv-router fetch --tier-models 3b
+
+# 准备配置（默认 config.example.json 的路径与 fetch 产物对齐，开箱即用）
 cp sidecar/config.example.json config.json
-# 编辑 config.json：填入本地模型路径和/或云端 upstream
+# 编辑 config.json：填入云端 upstream（R2/R3 透传用）
 
 # 启动网关（默认监听 127.0.0.1:21750）
 ./target/release/rwkv-router serve
@@ -75,6 +81,7 @@ cp sidecar/config.example.json config.json
 
 ```bash
 rwkv-router serve                 # 网关守护进程（默认子命令）
+rwkv-router fetch                 # 下载模型包（MS/HF，含可选 --tier-models 3b|7b）
 rwkv-router route "帮我写首诗"     # 单次决策，打印 JSON（可 --session / --config）
 rwkv-router stats                 # 捕获样本库统计
 rwkv-router label 12 R2           # 给第 12 条样本标注正确层级（clear 可撤销）
@@ -221,6 +228,8 @@ const out = s.generate('R0', '你好')
 | `evolution.auto_evolve_step` | usize | 50 | 每新增 N 条已标注自动进化 |
 
 upstream 三选一：`builtin-rwkv`（`model` + `tokenizer`）、`openai`（`base_url` 含 `/v1` + `model` + `api_key_env`）、`anthropic`（`base_url` 不含 `/v1`）。
+
+`build_eval_pack.py` 等完整工具链见 [`training/`](training/) 目录：分类头训练脚本（torch）、闸门包/回放池构建、评估脚本，以及**现成的 `eval_pack.json` + `replay_pool.json`**（可直接用于 `packs_dir`）与边界困难样本特征集。特征行契约与 head JSON 契约见 [training/README.md](training/README.md)。
 
 ## 与客户端（Ai00-X）的关系
 
