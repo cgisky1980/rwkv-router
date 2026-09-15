@@ -1,0 +1,114 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 方案 B：低秩链第二级融合（gemv_affine + 激活 + v 链 lerp）。
+// 第一级 gemv 保持不变（输出 mid 向量），本 shader 一次完成第二级投影 + 激活 + 输出变换。
+// 每个 workgroup 处理一个输出行（M=C），dispatch (M, 1, 1)。
+//
+// OP 由编译期 define 区分：
+//   OP == 0 (w)：out = exp(scale * sigmoid(x @ A + bias))             [w2, w0, scale_w]
+//   OP == 1 (a)：out = sigmoid(x @ A + bias)                          [a2, a0]
+//   OP == 2 (v)：out = v + sigmoid(x @ A + bias) * (v_first - v)      [v2, v0, v_first]（原地写 v）
+//   OP == 3 (g)：out = sigmoid(x) @ A                                [g2]（sigmoid 作用于 mid，无 bias、无输出变换）
+
+layout(constant_id = 0) const uint M = 4096;   // 输出维度（C）
+layout(constant_id = 1) const uint K = 4096;   // mid 维度
+
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=2），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_dot[NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer InputA      { float data[]; } input_a;
+layout(buffer_reference) buffer InputBias   { float data[]; } input_bias;
+layout(buffer_reference) buffer InputX      { float data[]; } input_x;
+layout(buffer_reference) buffer InputScale  { float data[]; } input_scale;
+layout(buffer_reference) buffer InputVFirst { float data[]; } input_v_first;
+layout(buffer_reference) buffer Output      { float data[]; } output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputA      input_a;
+    InputBias   input_bias;
+    InputX      input_x;
+    InputScale  input_scale;
+    InputVFirst input_v_first;
+    Output      output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationIndex;
+    const uint subgroup_id = gl_SubgroupID;
+    const uint subgroup_invocation_id = gl_SubgroupInvocationID;
+
+    InputA      input_a      = params.input_a;
+    InputBias   input_bias   = params.input_bias;
+    InputX      input_x      = params.input_x;
+    InputScale  input_scale  = params.input_scale;
+    InputVFirst input_v_first = params.input_v_first;
+    Output      output_y     = params.output_y;
+
+    // Phase 1: 点积（g 链对 mid 先做 sigmoid）
+    float local_dot = 0.0;
+    [[unroll]]
+    for (uint k = index; k < K; k += BLOCK_SIZE) {
+        float x_val = input_x.data[k];
+#if OP == 3
+        x_val = sigmoid(x_val);
+#endif
+        local_dot += x_val * input_a.data[row * K + k];
+    }
+
+    // Subgroup-level reduction
+    local_dot = subgroupAdd(local_dot);
+    if (subgroup_invocation_id == 0) {
+        sketch_dot[subgroup_id] = local_dot;
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_dot[index] += sketch_dot[index + step];
+        }
+        barrier();
+    }
+
+    // Phase 2: 输出变换
+    if (index == 0) {
+        float result = sketch_dot[0];
+#if OP == 3
+        // g：无 bias、无输出变换
+        output_y.data[row] = result;
+#else
+        result = result + input_bias.data[row];
+        float a_sig = sigmoid(result);
+#if OP == 0
+        // w：exp(scale * sigmoid)
+        output_y.data[row] = exp(a_sig * input_scale.data[0]);
+#elif OP == 1
+        // a：sigmoid
+        output_y.data[row] = a_sig;
+#else
+        // v：原地 lerp v = v + a_sig * (v_first - v)
+        float vcur = output_y.data[row];
+        output_y.data[row] = vcur + a_sig * (input_v_first.data[row] - vcur);
+#endif
+#endif
+    }
+}

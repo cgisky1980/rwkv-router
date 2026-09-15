@@ -1,0 +1,135 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合：y_norm = group_norm(y, ln_x_w, ln_x_b) + sum_rk_rk 的 extra 项。
+// 每个 head（N 个元素）一个 workgroup：
+//   1) 计算 y 的 mean / var，归一化 + 仿射 → 临时 normalized
+//   2) s = sum_j r[j] * k_mod[j] * r_k[j]
+//   3) y_norm[j] = normalized[j] + s * v[j]
+// 一次 dispatch 完成原先 norm + sum_rk_rk 两次。
+// 单 token（batch=1）路径，dispatch (H, 1, 1)。
+
+layout(constant_id = 0) const uint H = 1;      // Number of heads
+layout(constant_id = 1) const uint N = 64;     // Head size
+layout(constant_id = 2) const float EPSILON = 1e-6;
+
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=3），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_sum[NUM_SUBGROUPS];
+shared float sketch_sq_sum[NUM_SUBGROUPS];
+shared float sketch_s[NUM_SUBGROUPS];
+shared float mean;
+shared float inv_std;
+shared float s_acc;
+
+layout(buffer_reference) buffer BufY   { float data[]; }  input_y;    // y
+layout(buffer_reference) buffer BufG   { float data[]; }  gamma;      // ln_x_w
+layout(buffer_reference) buffer BufB   { float data[]; }  beta;       // ln_x_b
+layout(buffer_reference) buffer BufR   { float data[]; }  input_r;    // r
+layout(buffer_reference) buffer BufKM  { float data[]; }  input_km;   // k_mod
+layout(buffer_reference) buffer BufRK  { float data[]; }  input_rk;   // r_k (shared [H,N])
+layout(buffer_reference) buffer BufV   { float data[]; }  input_v;    // v
+layout(buffer_reference) buffer BufYO  { float data[]; }  out_yn;     // y_norm (out)
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufY   input_y;
+    BufG   gamma;
+    BufB   beta;
+    BufR   input_r;
+    BufKM  input_km;
+    BufRK  input_rk;
+    BufV   input_v;
+    BufYO  out_yn;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch  = gl_WorkGroupID.y;
+    const uint head   = gl_WorkGroupID.x;
+    const uint index  = gl_LocalInvocationIndex;
+    const uint sg     = gl_SubgroupID;
+    const uint sgid   = gl_SubgroupInvocationID;
+    const uint base   = batch * (H * N) + head * N;
+    const uint w_base = head * N;
+
+    BufY   input_y  = params.input_y;
+    BufG   gamma    = params.gamma;
+    BufB   beta     = params.beta;
+    BufR   input_r  = params.input_r;
+    BufKM  input_km = params.input_km;
+    BufRK  input_rk = params.input_rk;
+    BufV   input_v  = params.input_v;
+    BufYO  out_yn   = params.out_yn;
+
+    // Phase 1: group-norm sum / sq_sum over y[head]
+    float local_sum = 0.0;
+    float local_sq = 0.0;
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        float y = input_y.data[base + j];
+        local_sum += y;
+        local_sq += y * y;
+    }
+    local_sum = subgroupAdd(local_sum);
+    local_sq = subgroupAdd(local_sq);
+    if (sgid == 0) {
+        sketch_sum[sg] = local_sum;
+        sketch_sq_sum[sg] = local_sq;
+    }
+    barrier();
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sum[index] += sketch_sum[index + step];
+            sketch_sq_sum[index] += sketch_sq_sum[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        float sum = sketch_sum[0];
+        float sq = sketch_sq_sum[0];
+        mean = sum / float(N);
+        float variance = sq / float(N) - mean * mean;
+        inv_std = inversesqrt(variance + EPSILON);
+    }
+    barrier();
+
+    // Phase 2: s = sum_j r[j]*k_mod[j]*r_k[j]
+    float local_s = 0.0;
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        local_s += input_r.data[base + j]
+                 * input_km.data[base + j]
+                 * input_rk.data[w_base + j];
+    }
+    local_s = subgroupAdd(local_s);
+    if (sgid == 0) {
+        sketch_s[sg] = local_s;
+    }
+    barrier();
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_s[index] += sketch_s[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        s_acc = sketch_s[0];
+    }
+    barrier();
+
+    // Phase 3: y_norm[j] = (y[j]-mean)*inv_std*gamma[j]+beta[j] + s*v[j]
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        float y = input_y.data[base + j];
+        float normalized = (y - mean) * inv_std * gamma.data[w_base + j] + beta.data[w_base + j];
+        out_yn.data[base + j] = normalized + s_acc * input_v.data[base + j];
+    }
+}

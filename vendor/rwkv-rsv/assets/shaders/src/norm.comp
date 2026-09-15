@@ -1,0 +1,134 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint C = 4096;    // Hidden size
+layout(constant_id = 1) const uint H = 1;       // Number of heads
+
+layout(constant_id = 2) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 3) const uint STRIDE_X_Y = 4096;       // Stride along H axis of X
+layout(constant_id = 4) const uint STRIDE_X_Z = 4096;       // Batch stride of X
+
+layout(constant_id = 5) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 6) const uint STRIDE_Y_Y = 4096;       // Stride along H axis of Y
+layout(constant_id = 7) const uint STRIDE_Y_Z = 4096;       // Batch stride of Y
+
+layout(constant_id = 8) const uint STRIDE_G_X = 1;          // Innermost stride of Gamma
+layout(constant_id = 9) const uint STRIDE_G_Y = 4096;       // Stride along H axis of Gamma
+layout(constant_id = 10) const uint STRIDE_G_Z = 4096;      // Batch stride of Gamma
+
+layout(constant_id = 11) const uint STRIDE_B_X = 1;         // Innermost stride of Beta
+layout(constant_id = 12) const uint STRIDE_B_Y = 4096;      // Stride along H axis of Beta
+layout(constant_id = 13) const uint STRIDE_B_Z = 4096;      // Batch stride of Beta
+
+layout(constant_id = 14) const float EPSILON = 1e-5;
+
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=15），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 15) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+const uvec3 STRIDE_X        = uvec3(STRIDE_X_X, STRIDE_X_Y, STRIDE_X_Z);
+const uvec3 STRIDE_Y        = uvec3(STRIDE_Y_X, STRIDE_Y_Y, STRIDE_Y_Z);
+const uvec3 STRIDE_G        = uvec3(STRIDE_G_X, STRIDE_G_Y, STRIDE_G_Z);
+const uvec3 STRIDE_B        = uvec3(STRIDE_B_X, STRIDE_B_Y, STRIDE_B_Z);
+
+shared I_TYPE   sketch_sum[NUM_SUBGROUPS];
+shared I_TYPE   sketch_sq_sum[NUM_SUBGROUPS];
+shared I_TYPE   mean;
+shared I_TYPE   inv_std;
+
+layout(buffer_reference) buffer Input   { I_TYPE data[]; }  input_x;
+layout(buffer_reference) buffer Gamma   { I_TYPE data[]; }  gamma;
+layout(buffer_reference) buffer Beta    { I_TYPE data[]; }  beta;
+layout(buffer_reference) buffer Output  { O_TYPE data[]; }  output_o;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Input   input_x;
+    Gamma   gamma;
+    Beta    beta;
+    Output  output_o;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.y;
+    const uint head                     = gl_WorkGroupID.x;
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    const uint x_base                   = batch * STRIDE_X.z + head * STRIDE_X.y;
+    const uint y_base                   = batch * STRIDE_Y.z + head * STRIDE_Y.y;
+    const uint g_base                   = batch * STRIDE_G.z + head * STRIDE_G.y;
+    const uint b_base                   = batch * STRIDE_B.z + head * STRIDE_B.y;
+
+    Input   input_x                     = params.input_x;
+    Gamma   gamma                       = params.gamma;
+    Beta    beta                        = params.beta;
+    Output  output_o                    = params.output_o;
+
+    // Phase 1: Compute sum and sum of squares using subgroup operations
+    I_TYPE local_sum = I_TYPE(0.0);
+    I_TYPE local_sq_sum = I_TYPE(0.0);
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        I_TYPE value = input_x.data[x_base + i * STRIDE_X.x];
+        local_sum += value;
+        local_sq_sum += value * value;
+    }
+
+    // Subgroup-level reduction
+    local_sum = subgroupAdd(local_sum);
+    local_sq_sum = subgroupAdd(local_sq_sum);
+
+    // Write subgroup result to shared memory
+    if (subgroup_invocation_id == 0) {
+        sketch_sum[subgroup_id] = local_sum;
+        sketch_sq_sum[subgroup_id] = local_sq_sum;
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sum[index] += sketch_sum[index + step];
+            sketch_sq_sum[index] += sketch_sq_sum[index + step];
+        }
+        barrier();
+    }
+
+    // Broadcast mean and variance to all threads
+    if (index == 0) {
+        I_TYPE sum = sketch_sum[0];
+        I_TYPE sq_sum = sketch_sq_sum[0];
+        mean = sum / I_TYPE(C);
+        I_TYPE variance = sq_sum / I_TYPE(C) - mean * mean;
+        inv_std = inversesqrt(variance + I_TYPE(EPSILON));
+    }
+    barrier();
+
+    // Phase 2: Normalize and apply affine transformation
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        I_TYPE value = input_x.data[x_base + i * STRIDE_X.x];
+        I_TYPE normalized = (value - mean) * inv_std;
+
+#if defined(AFFINE)
+        I_TYPE g = gamma.data[g_base + i * STRIDE_G.x];
+        I_TYPE b = beta.data[b_base + i * STRIDE_B.x];
+        normalized = normalized * g + b;
+#endif
+
+        output_o.data[y_base + i * STRIDE_Y.x] = O_TYPE(normalized);
+    }
+}

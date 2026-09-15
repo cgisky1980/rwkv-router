@@ -1,0 +1,27 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+// 把 host-visible 缓冲 in_tok[0]（f32 位模式存 uint 的 token 索引）追加到序列缓冲
+// out_seq[cnt]，随后 cnt 自增。供 GPU self-loop 记录每轮生成的 token，便于一次性
+// 下载验证序列正确性（无需每轮 CPU 回读）。
+// dispatch (1,1,1)，spec 恒空（不重建 pipeline）。
+
+layout(buffer_reference) buffer InTok { uint data[]; } in_tok;
+layout(buffer_reference) buffer OutSeq { uint data[]; } out_seq;
+layout(buffer_reference) buffer Cnt { uint data[]; } cnt;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InTok in_tok;
+    OutSeq out_seq;
+    Cnt cnt;
+} params;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint i = atomicAdd(params.cnt.data[0], 1u);
+    params.out_seq.data[i] = params.in_tok.data[0];
+}

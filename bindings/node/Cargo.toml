@@ -1,0 +1,20 @@
+[package]
+name = "rwkv-router-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node.js bindings for rwkv-router (npm package: rwkv-router)"
+
+# cdylib only: this crate exists to become `rwkv-router.<platform>.node`.
+# Logic lives in the core crate; this layer is a thin napi surface.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = "3"
+serde_json = "1"
+rwkv-router = { path = "../..", features = ["rwkv"] }
+
+[build-dependencies]
+napi-build = "2"

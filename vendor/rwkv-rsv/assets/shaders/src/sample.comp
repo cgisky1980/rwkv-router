@@ -1,0 +1,313 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// GPU 采样：penalty(repetition/frequency/presence) + temperature + top-k + top-p
+// 过滤后按概率采样，输出 token 索引。
+// 单 workgroup（dispatch (1,1,1)），BLOCK_SIZE=256 线程协作。
+// 相比把 65536 个 f32 logits（256KB）下载到 CPU 再采样，只在 GPU 完成并回传 4 字节索引。
+//
+// 流程：
+//   1. 载入 logits
+//   2. 惩罚：由历史 token 直方图统计计数，repetition(缩放) + frequency(次数偏移) + presence(存在偏移)
+//   3. temperature：temp[i] /= T（T<=0 时视为 1）
+//   4. top-k：迭代 top_k 次找出第 k 大 logits 作阈值，低于阈值的 temp 置 -inf
+//   5. softmax：max 归约 → exp → 归一化为概率（写回 temp）
+//   6. top-p：从最大概率起累积，达到 top_p 后截断（低于累计阈值概率的 temp 置 0）
+//   7. 采样：splitmix 生成均匀随机数 u，multipass 区间归约定位累计概率分位点 → token
+//
+// 惩罚公式（与 OpenAI / vLLM / llama.cpp 主流一致，均作用于 softmax 前的 logits）：
+//   repetition_penalty：对出现过的 token，logit>0 时 /=rep，logit<0 时 *=rep（缩放，1.0=禁用）
+//   frequency_penalty：logit -= freq * 出现次数（次数偏移，0.0=禁用）
+//   presence_penalty： 出现过的 token 一律 logit -= pres（存在偏移，0.0=禁用）
+//
+// 采样参数放在 sampler 缓冲（host-visible，CPU 直接写，8 元素）：
+//   [0] temperature（f32 位模式）
+//   [1] top_k（uint，0 = 禁用）
+//   [2] top_p（f32 位模式，1.0 = 禁用）
+//   [3] seed（uint，每次采样一个递增值）
+//   [4] repetition_penalty（f32 位模式，1.0 = 禁用）
+//   [5] frequency_penalty（f32 位模式，0.0 = 禁用）
+//   [6] presence_penalty（f32 位模式，0.0 = 禁用）
+//   [7] hist_len（uint，历史 token 数，0 = 无惩罚）
+
+layout(constant_id = 0) const uint N = 65536;  // logits 长度（vocab）
+
+const uint BLOCK_SIZE = 256;
+const uint MAX_TOP_P_ITERS = 512;  // top-p 累积迭代上限（防路径退化时死循环）
+
+layout(buffer_reference) buffer InLogits { float data[]; };
+layout(buffer_reference) buffer OutToken { uint data[]; };
+layout(buffer_reference) buffer Temp { float data[]; };    // 工作区 [N]
+layout(buffer_reference) buffer Mask { uint data[]; };     // top-k / top-p 已选标记 [N]
+layout(buffer_reference) buffer Counter { uint data[]; };  // 历史 token 计数 [N]
+layout(buffer_reference) buffer Hist { uint data[]; };     // 历史 token 序列 [hist_len]
+layout(buffer_reference) buffer Sampler { uint data[]; };  // [temp, top_k, top_p, seed, rep, freq, pres, hist_len]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InLogits in_logits;
+    OutToken out_token;
+    Temp temp;
+    Mask mask;
+    Counter counter;
+    Hist hist;
+    Sampler samp;
+} params;
+
+shared float shared_val[BLOCK_SIZE];
+shared uint  shared_idx[BLOCK_SIZE];
+shared float s_u;       // 采样的均匀随机数
+shared uint  s_b;       // 采样定位的块索引
+shared float s_base;    // 定位块之前的累积概率
+shared float g_cum;     // top-p 累积
+shared float g_cutoff;  // top-p 保留阈值
+
+// splitmix32：由 seed 生成 (0,1) 均匀随机数。
+float u01(uint s) {
+    s += 0x9E3779B9u;
+    uint z = s;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z ^= z >> 16;
+    return float(z) / 4294967296.0;
+}
+
+// 找 mask==0 的最大值（含索引），结果放 shared_val[0]/shared_idx[0]。
+// 平局取更小索引（与 CPU 严格大于 argmax 一致）。
+void reduce_max(uint index, Temp temp, Mask mask) {
+    float lm = -1e30;
+    uint  li = 0u;
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        if (mask.data[i] == 0u && temp.data[i] > lm) {
+            lm = temp.data[i];
+            li = i;
+        }
+    }
+    shared_val[index] = lm;
+    shared_idx[index] = li;
+    barrier();
+    [[unroll]]
+    for (uint step = BLOCK_SIZE >> 1; step > 0u; step >>= 1u) {
+        if (index < step) {
+            const float av = shared_val[index];
+            const uint  ai = shared_idx[index];
+            const float bv = shared_val[index + step];
+            const uint  bi = shared_idx[index + step];
+            if (bv > av || (bv == av && bi < ai)) {
+                shared_val[index] = bv;
+                shared_idx[index] = bi;
+            }
+        }
+        barrier();
+    }
+}
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+
+    InLogits in_logits = params.in_logits;
+    OutToken out_token = params.out_token;
+    Temp temp = params.temp;
+    Mask mask = params.mask;
+    Sampler samp = params.samp;
+
+    const float temperature = uintBitsToFloat(samp.data[0]);
+    const uint  top_k       = samp.data[1];
+    const float top_p       = uintBitsToFloat(samp.data[2]);
+    const uint  seed        = samp.data[3];
+    const float rep         = uintBitsToFloat(samp.data[4]);
+    const float freq        = uintBitsToFloat(samp.data[5]);
+    const float pres        = uintBitsToFloat(samp.data[6]);
+    const uint  hist_len    = samp.data[7];
+
+    Counter counter = params.counter;
+    Hist hist = params.hist;
+
+    // ---------- 1. 载入 logits ----------
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        temp.data[i] = in_logits.data[i];
+    }
+
+    // ---------- 2. 惩罚（repetition / frequency / presence） ----------
+    if (hist_len > 0u && (rep != 1.0 || freq != 0.0 || pres != 0.0)) {
+        // 清零直方图
+        for (uint i = index; i < N; i += BLOCK_SIZE) counter.data[i] = 0u;
+        barrier();
+        // 统计历史 token 出现次数
+        [[unroll]]
+        for (uint h = index; h < hist_len; h += BLOCK_SIZE) {
+            atomicAdd(counter.data[hist.data[h]], 1u);
+        }
+        barrier();
+        // 按计数施加惩罚（作用于 softmax 前的 logits）
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            const uint cnt = counter.data[i];
+            float l = temp.data[i];
+            if (cnt > 0u) {
+                if (rep != 1.0) l = l > 0.0 ? l / rep : l * rep;
+                if (pres != 0.0) l -= pres;
+            }
+            if (freq != 0.0) l -= freq * float(cnt);
+            temp.data[i] = l;
+        }
+        barrier();
+    }
+
+    // ---------- 3. temperature ----------
+    float invT = 1.0 / temperature;
+    if (!(temperature > 0.0)) invT = 1.0;
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        temp.data[i] *= invT;
+    }
+
+    // ---------- 4. top-k ----------
+    if (top_k > 0u && top_k < N) {
+        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[i] = 0u;
+        barrier();
+        float threshold = -1e30;
+        for (uint round = 0u; round < top_k; round++) {
+            reduce_max(index, temp, mask);
+            if (index == 0u) {
+                threshold = shared_val[0];
+                mask.data[shared_idx[0]] = 1u;
+            }
+            barrier();
+        }
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            if (temp.data[i] < threshold) temp.data[i] = -1e30;
+        }
+        barrier();
+    }
+
+    // ---------- 5. softmax ----------
+    {
+        // max 归约
+        float lm = -1e30;
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) lm = max(lm, temp.data[i]);
+        shared_val[index] = lm;
+        barrier();
+        [[unroll]]
+        for (uint step = BLOCK_SIZE >> 1; step > 0u; step >>= 1u) {
+            if (index < step) shared_val[index] = max(shared_val[index], shared_val[index + step]);
+            barrier();
+        }
+        const float m = shared_val[0];
+        barrier();
+        // exp + sum
+        float s = 0.0;
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            float v = exp(temp.data[i] - m);
+            temp.data[i] = v;
+            s += v;
+        }
+        shared_val[index] = s;
+        barrier();
+        [[unroll]]
+        for (uint step = BLOCK_SIZE >> 1; step > 0u; step >>= 1u) {
+            if (index < step) shared_val[index] += shared_val[index + step];
+            barrier();
+        }
+        const float total = shared_val[0];
+        barrier();
+        if (total > 0.0) {
+            [[unroll]]
+            for (uint i = index; i < N; i += BLOCK_SIZE) temp.data[i] /= total;
+        }
+        barrier();
+    }
+
+    // ---------- 6. top-p ----------
+    if (top_p > 0.0 && top_p < 1.0) {
+        for (uint i = index; i < N; i += BLOCK_SIZE) mask.data[i] = 0u;
+        barrier();
+        if (index == 0u) {
+            g_cum = 0.0;
+            g_cutoff = 0.0;
+        }
+        barrier();
+        for (int cnt = 0; cnt < MAX_TOP_P_ITERS && g_cum < top_p; cnt++) {
+            reduce_max(index, temp, mask);
+            if (index == 0u) {
+                mask.data[shared_idx[0]] = 1u;
+                g_cum += shared_val[0];
+                g_cutoff = shared_val[0];
+            }
+            barrier();
+        }
+        barrier();
+        [[unroll]]
+        for (uint i = index; i < N; i += BLOCK_SIZE) {
+            if (temp.data[i] < g_cutoff) temp.data[i] = 0.0;
+        }
+        barrier();
+    }
+
+    // ---------- 7. 采样 ----------
+    // 重新算 total（top-p 截断后）
+    float ts = 0.0;
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) ts += temp.data[i];
+    shared_val[index] = ts;
+    barrier();
+    [[unroll]]
+    for (uint step = BLOCK_SIZE >> 1; step > 0u; step >>= 1u) {
+        if (index < step) shared_val[index] += shared_val[index + step];
+        barrier();
+    }
+    const float total = shared_val[0];
+    barrier();
+    if (index == 0u) {
+        s_u = u01(seed) * total;
+    }
+    barrier();
+
+    // 每线程区间和（块 = BLOCK_SIZE 连续元素）
+    float ps = 0.0;
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) ps += temp.data[i];
+    shared_val[index] = ps;
+    barrier();
+
+    // 线程0 前缀和定位 u 所在块
+    if (index == 0u) {
+        float acc = 0.0;
+        uint  b = BLOCK_SIZE;
+        float base = 0.0;
+        for (uint j = 0u; j < BLOCK_SIZE; j++) {
+            const float v = shared_val[j];
+            if (b == BLOCK_SIZE && acc + v > s_u) {
+                b = j;
+                base = acc;
+            }
+            acc += v;
+        }
+        s_b = b;
+        s_base = base;
+    }
+    barrier();
+
+    // 块 b 内累积定位精确 token
+    if (index == s_b) {
+        float acc = s_base;
+        uint  chosen = s_b * BLOCK_SIZE;
+        [[unroll]]
+        for (uint i = 0u; i < BLOCK_SIZE; i++) {
+            acc += temp.data[s_b * BLOCK_SIZE + i];
+            if (acc > s_u) {
+                chosen = s_b * BLOCK_SIZE + i;
+                break;
+            }
+        }
+        out_token.data[0] = chosen;
+    }
+}

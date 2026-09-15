@@ -1,0 +1,101 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint H = 1;            // Number of heads
+layout(constant_id = 1) const uint N = 64;           // Head size
+
+layout(constant_id = 2) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 3) const uint STRIDE_X_Y = 64;         // Stride along H axis of X
+layout(constant_id = 4) const uint STRIDE_X_Z = 64;         // Batch stride of X
+
+layout(constant_id = 5) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 6) const uint STRIDE_Y_Y = 64;         // Stride along H axis of Y
+layout(constant_id = 7) const uint STRIDE_Y_Z = 64;         // Batch stride of Y
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=8），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 8) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+const uvec3 STRIDE_X        = uvec3(STRIDE_X_X, STRIDE_X_Y, STRIDE_X_Z);
+const uvec3 STRIDE_Y        = uvec3(STRIDE_Y_X, STRIDE_Y_Y, STRIDE_Y_Z);
+
+// Each workgroup processes one head (N elements). The workgroup cooperatively computes
+// sum_sq = sum_i x_i^2, then broadcasts inv_norm = 1 / max(sqrt(sum_sq), 1e-12) and
+// writes y_i = x_i * inv_norm.
+
+shared I_TYPE   sketch_sq_sum[NUM_SUBGROUPS];
+shared I_TYPE   inv_norm;
+
+layout(buffer_reference) buffer Input   { I_TYPE data[]; }  input_x;
+layout(buffer_reference) buffer Output  { O_TYPE data[]; }  output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Input   input_x;
+    Output  output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.y;
+    const uint head                     = gl_WorkGroupID.x;
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    const uint x_base                   = batch * STRIDE_X.z + head * STRIDE_X.y;
+    const uint y_base                   = batch * STRIDE_Y.z + head * STRIDE_Y.y;
+
+    Input   input_x                     = params.input_x;
+    Output  output_y                    = params.output_y;
+
+    // Phase 1: Compute sum of squares using subgroup operations
+    I_TYPE local_sq_sum = I_TYPE(0.0);
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        I_TYPE value = input_x.data[x_base + i * STRIDE_X.x];
+        local_sq_sum += value * value;
+    }
+
+    // Subgroup-level reduction
+    local_sq_sum = subgroupAdd(local_sq_sum);
+
+    // Write subgroup result to shared memory
+    if (subgroup_invocation_id == 0) {
+        sketch_sq_sum[subgroup_id] = local_sq_sum;
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sq_sum[index] += sketch_sq_sum[index + step];
+        }
+        barrier();
+    }
+
+    // Broadcast inverse norm to all threads
+    if (index == 0) {
+        I_TYPE sum_sq = sketch_sq_sum[0];
+        I_TYPE norm = max(sqrt(sum_sq), I_TYPE(1e-12));
+        inv_norm = I_TYPE(1.0) / norm;
+    }
+    barrier();
+
+    // Phase 2: Normalize
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        I_TYPE value = input_x.data[x_base + i * STRIDE_X.x];
+        output_y.data[y_base + i * STRIDE_Y.x] = O_TYPE(value * inv_norm);
+    }
+}

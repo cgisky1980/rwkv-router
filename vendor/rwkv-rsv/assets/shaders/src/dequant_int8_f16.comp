@@ -1,0 +1,82 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// int8 → fp16 反量化（prefill 方案A：大矩阵反量化到共享 scratch 后走 tensor-core GEMM）。
+// 输入 int8 格式（W[M, K] 行主序，K 为收缩维，group=128）：
+//   idx: uint8 [M, K]   每权重 1 字节（0..255）
+//   sz:  uint32 [M, K/128] 每元素 = (scale: fp16 低16位 | zero: fp16 高16位)
+// 输出 fp16 [M, K] 行主序（与 load_linear_f16 上传布局一致，直接作 gemm B 矩阵）。
+// 反量化：w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]
+//
+// 每线程处理 1 个 uint32 = 4 个权重。grid.x = ceil(M * K/4 / BLOCK_SIZE)。
+// 要求 K % 128 == 0。
+// 写优化与 dequant_any4_f16.comp 相同：4 个 fp16 先 pack 成 2 个 uint32 存 shared，
+// barrier 后全 wg 线性写出（完全合并）。
+
+layout(constant_id = 0) const uint M = 4096;        // 行数
+layout(constant_id = 1) const uint K = 4096;        // 列数（收缩维）
+
+const uint BLOCK_SIZE = 256;
+const uint KV = K / 4;    // 每行 uint32 数（4 个 uint8 权重/uint32）
+const uint KG = K / 128;  // 每行 group 数
+
+shared uint sh[BLOCK_SIZE * 2];  // 每线程 4 fp16 = 2 uint32
+
+layout(buffer_reference) buffer InputIdx { uint data[]; }      input_idx; // uint8 打包为 uint32
+layout(buffer_reference) buffer InputSZ  { uint data[]; }      input_sz;
+layout(buffer_reference) buffer OutputW  { uint data[]; }      output_w;  // fp16x2 packed
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputIdx input_idx;
+    InputSZ  input_sz;
+    OutputW  output_w;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint linear = gl_GlobalInvocationID.x;
+    const uint local  = gl_LocalInvocationID.x;
+    const uint total  = M * KV;
+
+    InputIdx input_idx   = params.input_idx;
+    InputSZ  input_sz    = params.input_sz;
+    OutputW  output_w    = params.output_w;
+
+    if (linear < total) {
+        const uint m  = linear / KV;
+        const uint kk = linear % KV;         // 行内 uint32 索引
+        const uint g  = kk / 32;             // group = (kk*4) / 128
+
+        const vec2 szv = unpackFloat2x16(input_sz.data[m * KG + g]);
+        const float sc = szv.x;
+        const float zr = szv.y;
+
+        const uint ipack = input_idx.data[linear];
+
+        const float b0 = float(ipack & 0xFFu);
+        const float b1 = float((ipack >> 8) & 0xFFu);
+        const float b2 = float((ipack >> 16) & 0xFFu);
+        const float b3 = float(ipack >> 24);
+        const float w0 = sc * b0 + zr;
+        const float w1 = sc * b1 + zr;
+        const float w2 = sc * b2 + zr;
+        const float w3 = sc * b3 + zr;
+        sh[local * 2 + 0] = packHalf2x16(vec2(w0, w1));
+        sh[local * 2 + 1] = packHalf2x16(vec2(w2, w3));
+    }
+    barrier();
+
+    // 全 wg 线性写出：lane 间地址连续（每 warp 128B 事务，100% 合并）
+    const uint wg_base  = gl_WorkGroupID.x * BLOCK_SIZE;
+    const uint out_base = wg_base * 2;                     // 本 wg 输出起始 uint32 索引
+    const uint rem      = min(total - wg_base, BLOCK_SIZE); // 本 wg 有效线程数
+    for (uint j = local; j < rem * 2; j += BLOCK_SIZE) {
+        output_w.data[out_base + j] = sh[j];
+    }
+}

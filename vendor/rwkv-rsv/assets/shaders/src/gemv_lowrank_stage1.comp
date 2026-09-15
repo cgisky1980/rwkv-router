@@ -1,0 +1,129 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合低秩第一级（v1/w1/a1/g1）→ 1 次 dispatch。
+// 每个 workgroup 计算一个 mid 输出行，dispatch (VM+WM+AM+GM, 1, 1)。
+// 相比 4 次独立 gemv，省 3 次 dispatch/层。
+//   v_mid = xv @ v1
+//   w_mid = tanh(xw @ w1)
+//   a_mid = xa @ a1
+//   g_mid = xg @ g1
+// 权重 A 为 f32 [out, in]（未补齐），输入 X 为 f32 [C]。
+
+layout(constant_id = 0) const uint C  = 2560; // 收缩维度
+layout(constant_id = 1) const uint VM = 64;   // v 链 mid 行数
+layout(constant_id = 2) const uint WM = 96;   // w 链 mid 行数
+layout(constant_id = 3) const uint AM = 96;   // a 链 mid 行数
+layout(constant_id = 4) const uint GM = 320;  // g 链 mid 行数
+
+const uint BLOCK_SIZE    = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=5），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_dot[NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer InV1 { float data[]; };
+layout(buffer_reference) buffer InW1 { float data[]; };
+layout(buffer_reference) buffer InA1 { float data[]; };
+layout(buffer_reference) buffer InG1 { float data[]; };
+layout(buffer_reference) buffer InXV { float data[]; };
+layout(buffer_reference) buffer InXW { float data[]; };
+layout(buffer_reference) buffer InXA { float data[]; };
+layout(buffer_reference) buffer InXG { float data[]; };
+layout(buffer_reference) buffer OutV { float data[]; };
+layout(buffer_reference) buffer OutW { float data[]; };
+layout(buffer_reference) buffer OutA { float data[]; };
+layout(buffer_reference) buffer OutG { float data[]; };
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InV1 in_v1;
+    InW1 in_w1;
+    InA1 in_a1;
+    InG1 in_g1;
+    InXV in_xv;
+    InXW in_xw;
+    InXA in_xa;
+    InXG in_xg;
+    OutV out_v;
+    OutW out_w;
+    OutA out_a;
+    OutG out_g;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint total = VM + WM + AM + GM;
+    const uint flat_idx = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationIndex;
+    const uint subgroup_id = gl_SubgroupID;
+    const uint subgroup_invocation_id = gl_SubgroupInvocationID;
+
+    uint chain = 3;
+    uint row   = 0;
+    float local_dot = 0.0;
+    if (flat_idx < VM) {
+        chain = 0;
+        row   = flat_idx;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += params.in_v1.data[row * C + k] * params.in_xv.data[k];
+        }
+    } else if (flat_idx < VM + WM) {
+        chain = 1;
+        row   = flat_idx - VM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += params.in_w1.data[row * C + k] * params.in_xw.data[k];
+        }
+    } else if (flat_idx < VM + WM + AM) {
+        chain = 2;
+        row   = flat_idx - VM - WM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += params.in_a1.data[row * C + k] * params.in_xa.data[k];
+        }
+    } else {
+        row = flat_idx - VM - WM - AM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += params.in_g1.data[row * C + k] * params.in_xg.data[k];
+        }
+    }
+
+    // 子组归约
+    local_dot = subgroupAdd(local_dot);
+    if (subgroup_invocation_id == 0) {
+        sketch_dot[subgroup_id] = local_dot;
+    }
+    barrier();
+
+    // 跨子组归约
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_dot[index] += sketch_dot[index + step];
+        }
+        barrier();
+    }
+
+    if (index == 0) {
+        float result = sketch_dot[0];
+        if (chain == 0) {
+            params.out_v.data[row] = result;
+        } else if (chain == 1) {
+            params.out_w.data[row] = tanh(result);
+        } else if (chain == 2) {
+            params.out_a.data[row] = result;
+        } else {
+            params.out_g.data[row] = result;
+        }
+    }
+}

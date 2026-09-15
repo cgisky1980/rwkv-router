@@ -1,0 +1,262 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 深度融合：gemv_rkv_f16（r/k/v 三个 C×C 投影）+ lowrank_stage1（v1/w1/a1/g1 四个 mid 投影）
+// → 1 次 dispatch。相比分开 2 次，省 1 次 dispatch/层。
+//   r = xr @ R^T；k = xk @ K^T；v = xv @ V^T        （fp16 权重，f32 输入/输出/累加）
+//   v_mid = xv @ V1；w_mid = tanh(xw @ W1)；
+//   a_mid = xa @ A1；g_mid = xg @ G1                （fp32 权重）
+//
+// 并行化（带宽优化）：每个 workgroup 处理 ROWS=4 行 r/k/v，每线程一次加载 x（xr/xk/xv）
+// 后在内层 r 循环复用于全部 4 行。相比 1 行/workgroup（x 被 C 个 workgroup 各完整重读 =
+// 78MB L2 冗余流量，与权重流抢占带宽，仅 ~65% 利用率），本版本把 x 冗余读取降 4×，
+// 让权重流主导 DRAM/带宽，提升利用率。
+//
+// dispatch (C/ROWS + VM + WM + AM + GM, 1, 1)：
+//   前 C/ROWS 个 workgroup 各算 ROWS 行 r/k/v；
+//   后 VM+WM+AM+GM 个 workgroup 各算一个 mid 输出。
+
+layout(constant_id = 0) const uint C  = 2560; // 收缩维度
+layout(constant_id = 1) const uint VM = 64;   // v 链 mid 行数
+layout(constant_id = 2) const uint WM = 96;   // w 链 mid 行数
+layout(constant_id = 3) const uint AM = 96;   // a 链 mid 行数
+layout(constant_id = 4) const uint GM = 320;  // g 链 mid 行数
+
+const uint ROWS           = 4;    // 每 workgroup 处理的 r/k/v 行数（须整除 C，与 runtime GEMV_ROWS 严格一致）
+const uint BLOCK_SIZE     = 128;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=5），不能写死 32（AMD=64，Intel 可变）。
+// 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（128 % 32/64/16 均整除）。
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV             = C / 8;   // 8 个 fp16 打包为两个 uint64（16 字节/次加载）
+
+shared float sketch_dot[ROWS][3][NUM_SUBGROUPS]; // r/k/v 归约（每行一组）
+shared float sketch_mid[NUM_SUBGROUPS];          // mid 单累加器归约
+
+layout(buffer_reference) buffer InR { uint64_t data[]; } in_r;   // fp16 [C,C]
+layout(buffer_reference) buffer InK { uint64_t data[]; } in_k;
+layout(buffer_reference) buffer InV { uint64_t data[]; } in_v;
+layout(buffer_reference) buffer InV1 { float data[]; }  in_v1;   // fp32 [VM,C]
+layout(buffer_reference) buffer InW1 { float data[]; }  in_w1;
+layout(buffer_reference) buffer InA1 { float data[]; }  in_a1;
+layout(buffer_reference) buffer InG1 { float data[]; }  in_g1;
+layout(buffer_reference) buffer InXR { vec4 data[]; }   in_xr;   // f32 [C]
+layout(buffer_reference) buffer InXK { vec4 data[]; }   in_xk;
+layout(buffer_reference) buffer InXV { vec4 data[]; }   in_xv;
+layout(buffer_reference) buffer InXW { float data[]; }  in_xw;
+layout(buffer_reference) buffer InXA { float data[]; }  in_xa;
+layout(buffer_reference) buffer InXG { float data[]; }  in_xg;
+layout(buffer_reference) buffer OutR { float data[]; }  out_r;
+layout(buffer_reference) buffer OutK { float data[]; }  out_k;
+layout(buffer_reference) buffer OutV { float16_t data[]; } out_v;
+layout(buffer_reference) buffer OutVm { float data[]; } out_vm;
+layout(buffer_reference) buffer OutWm { float data[]; } out_wm;
+layout(buffer_reference) buffer OutAm { float data[]; } out_am;
+layout(buffer_reference) buffer OutGm { float data[]; } out_gm;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InR   in_r;
+    InK   in_k;
+    InV   in_v;
+    InV1  in_v1;
+    InW1  in_w1;
+    InA1  in_a1;
+    InG1  in_g1;
+    InXR  in_xr;
+    InXK  in_xk;
+    InXV  in_xv;
+    InXW  in_xw;
+    InXA  in_xa;
+    InXG  in_xg;
+    OutR  out_r;
+    OutK  out_k;
+    OutV  out_v;
+    OutVm out_vm;
+    OutWm out_wm;
+    OutAm out_am;
+    OutGm out_gm;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint flat_idx     = gl_WorkGroupID.x;
+    const uint index        = gl_LocalInvocationIndex;
+    const uint subgroup_id  = gl_SubgroupID;
+    const uint sub_inv      = gl_SubgroupInvocationID;
+
+    // ===== 分支 1：前 C/ROWS 个 workgroup 算 r/k/v（fp16 权重，f32 输入）=====
+    if (flat_idx < C / ROWS) {
+        const uint row_base = flat_idx * ROWS;
+        InR   ir = params.in_r;
+        InK   ik = params.in_k;
+        InV   iv = params.in_v;
+        InXR  xr = params.in_xr;
+        InXK  xk = params.in_xk;
+        InXV  xv = params.in_xv;
+        OutR  orr = params.out_r;
+        OutK  ok  = params.out_k;
+        OutV  ov  = params.out_v;
+
+        float lr[ROWS]; float lk[ROWS]; float lv[ROWS];
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) { lr[r] = 0.0; lk[r] = 0.0; lv[r] = 0.0; }
+
+        [[unroll]]
+        for (uint k = index; k < KV; k += BLOCK_SIZE) {
+            // x 一次加载，复用于全部 ROWS 行（关键：消除逐行的 x 重读）
+            vec4 xrv0 = xr.data[2 * k];
+            vec4 xrv1 = xr.data[2 * k + 1];
+            vec4 xkv0 = xk.data[2 * k];
+            vec4 xkv1 = xk.data[2 * k + 1];
+            vec4 xvv0 = xv.data[2 * k];
+            vec4 xvv1 = xv.data[2 * k + 1];
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                const uint a_base = (row_base + r) * (C / 4);
+                uint64_t raw_r0 = ir.data[a_base + 2 * k];
+                uint64_t raw_r1 = ir.data[a_base + 2 * k + 1];
+                uint64_t raw_k0 = ik.data[a_base + 2 * k];
+                uint64_t raw_k1 = ik.data[a_base + 2 * k + 1];
+                uint64_t raw_v0 = iv.data[a_base + 2 * k];
+                uint64_t raw_v1 = iv.data[a_base + 2 * k + 1];
+                vec2 ar00 = unpackFloat2x16(uint32_t(raw_r0 & 0xFFFFFFFFu));
+                vec2 ar01 = unpackFloat2x16(uint32_t(raw_r0 >> 32u));
+                vec2 ar10 = unpackFloat2x16(uint32_t(raw_r1 & 0xFFFFFFFFu));
+                vec2 ar11 = unpackFloat2x16(uint32_t(raw_r1 >> 32u));
+                vec2 ak00 = unpackFloat2x16(uint32_t(raw_k0 & 0xFFFFFFFFu));
+                vec2 ak01 = unpackFloat2x16(uint32_t(raw_k0 >> 32u));
+                vec2 ak10 = unpackFloat2x16(uint32_t(raw_k1 & 0xFFFFFFFFu));
+                vec2 ak11 = unpackFloat2x16(uint32_t(raw_k1 >> 32u));
+                vec2 av00 = unpackFloat2x16(uint32_t(raw_v0 & 0xFFFFFFFFu));
+                vec2 av01 = unpackFloat2x16(uint32_t(raw_v0 >> 32u));
+                vec2 av10 = unpackFloat2x16(uint32_t(raw_v1 & 0xFFFFFFFFu));
+                vec2 av11 = unpackFloat2x16(uint32_t(raw_v1 >> 32u));
+                lr[r] += ar00.x * xrv0.x + ar00.y * xrv0.y + ar01.x * xrv0.z + ar01.y * xrv0.w
+                       + ar10.x * xrv1.x + ar10.y * xrv1.y + ar11.x * xrv1.z + ar11.y * xrv1.w;
+                lk[r] += ak00.x * xkv0.x + ak00.y * xkv0.y + ak01.x * xkv0.z + ak01.y * xkv0.w
+                       + ak10.x * xkv1.x + ak10.y * xkv1.y + ak11.x * xkv1.z + ak11.y * xkv1.w;
+                lv[r] += av00.x * xvv0.x + av00.y * xvv0.y + av01.x * xvv0.z + av01.y * xvv0.w
+                       + av10.x * xvv1.x + av10.y * xvv1.y + av11.x * xvv1.z + av11.y * xvv1.w;
+            }
+        }
+
+        // 跨线程归约：先 subgroup 求和，再对 NUM_SUBGROUPS 做 shared 树归约
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            lr[r] = subgroupAdd(lr[r]);
+            lk[r] = subgroupAdd(lk[r]);
+            lv[r] = subgroupAdd(lv[r]);
+            if (sub_inv == 0) {
+                sketch_dot[r][0][subgroup_id] = lr[r];
+                sketch_dot[r][1][subgroup_id] = lk[r];
+                sketch_dot[r][2][subgroup_id] = lv[r];
+            }
+        }
+        barrier();
+        [[unroll]]
+        for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+            if (index < step) {
+                [[unroll]]
+                for (uint r = 0; r < ROWS; r++) {
+                    sketch_dot[r][0][index] += sketch_dot[r][0][index + step];
+                    sketch_dot[r][1][index] += sketch_dot[r][1][index + step];
+                    sketch_dot[r][2][index] += sketch_dot[r][2][index + step];
+                }
+            }
+            barrier();
+        }
+        if (index == 0) {
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                const uint row = row_base + r;
+                orr.data[row] = sketch_dot[r][0][0];
+                ok.data[row]  = sketch_dot[r][1][0];
+                ov.data[row]  = float16_t(sketch_dot[r][2][0]);
+            }
+        }
+        return;
+    }
+
+    // ===== 分支 2：后 VM+WM+AM+GM 个 workgroup 算 mid 投影（fp32 权重）=====
+    const uint mid_idx = flat_idx - C / ROWS;
+    uint chain = 3;
+    uint row   = 0;
+    float local_dot = 0.0;
+
+    InXW xw = params.in_xw;
+    InXA xa = params.in_xa;
+    InXG xg = params.in_xg;
+    InXV xv = params.in_xv;
+    InV1 v1 = params.in_v1;
+    InW1 w1 = params.in_w1;
+    InA1 a1 = params.in_a1;
+    InG1 g1 = params.in_g1;
+    OutVm o_vm = params.out_vm;
+    OutWm o_wm = params.out_wm;
+    OutAm o_am = params.out_am;
+    OutGm o_gm = params.out_gm;
+
+    if (mid_idx < VM) {
+        chain = 0;
+        row = mid_idx;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += v1.data[row * C + k] * xv.data[k / 4][k % 4];
+        }
+    } else if (mid_idx < VM + WM) {
+        chain = 1;
+        row = mid_idx - VM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += w1.data[row * C + k] * xw.data[k];
+        }
+    } else if (mid_idx < VM + WM + AM) {
+        chain = 2;
+        row = mid_idx - VM - WM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += a1.data[row * C + k] * xa.data[k];
+        }
+    } else {
+        row = mid_idx - VM - WM - AM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += g1.data[row * C + k] * xg.data[k];
+        }
+    }
+
+    local_dot = subgroupAdd(local_dot);
+    if (sub_inv == 0) {
+        sketch_mid[subgroup_id] = local_dot;
+    }
+    barrier();
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_mid[index] += sketch_mid[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        float result = sketch_mid[0];
+        if (chain == 0) {
+            o_vm.data[row] = result;
+        } else if (chain == 1) {
+            o_wm.data[row] = tanh(result);
+        } else if (chain == 2) {
+            o_am.data[row] = result;
+        } else {
+            o_gm.data[row] = result;
+        }
+    }
+    return;
+}

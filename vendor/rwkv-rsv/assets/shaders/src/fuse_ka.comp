@@ -1,0 +1,105 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// rwkv_ka_fusion（对标 albatross）：
+//   给定 k、k_k、a、k_a（均为 [H*N]），每个 head（N 个元素）输出：
+//     k_mod_i = k_i * (1 + k_a_i * (a_i - 1))        —— 替代 elementwise_lerp + mul
+//     kk_l2_i = normalize(k_i * k_k_i)                —— 替代 mul + l2_norm
+//     b_i     = -kk_l2_i * a_i                        —— 替代 mul_neg
+//   一次性消除原 4-5 次 kernel launch，减少每层每 token 的 GPU 联动。
+
+layout(constant_id = 0) const uint H = 1;      // Number of heads
+layout(constant_id = 1) const uint N = 64;     // Head size
+layout(constant_id = 2) const float EPSILON = 1e-12;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint BLOCK_SIZE    = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=3），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_sq[NUM_SUBGROUPS];
+shared float inv_norm;
+
+layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;   // k
+layout(buffer_reference) buffer BufKK { float data[]; }  buf_kk;  // k_k
+layout(buffer_reference) buffer BufA  { float data[]; }  buf_a;   // a
+layout(buffer_reference) buffer BufKA { float data[]; }  buf_ka;  // k_a
+layout(buffer_reference) buffer BufKM { float data[]; }  buf_km;  // k_mod (out)
+layout(buffer_reference) buffer BufKL { float data[]; }  buf_kl;  // kk_l2 (out)
+layout(buffer_reference) buffer BufB  { float data[]; }  buf_b;   // b = -kk_l2*a (out)
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufK   buf_k;
+    BufKK  buf_kk;
+    BufA   buf_a;
+    BufKA  buf_ka;
+    BufKM  buf_km;
+    BufKL  buf_kl;
+    BufB   buf_b;
+} params;
+
+void main() {
+    const uint batch  = gl_WorkGroupID.y;
+    const uint head   = gl_WorkGroupID.x;
+    const uint index  = gl_LocalInvocationIndex;
+    const uint sg     = gl_SubgroupID;
+    const uint sgid   = gl_SubgroupInvocationID;
+    // k / a / k_mod / kk_l2 / b 为 [T, H*N]（batch 偏移）
+    const uint base   = batch * (H * N) + head * N;
+    // k_k / k_a 为共享 [H*N] 权重（仅 head 偏移，无 batch）
+    const uint w_base = head * N;
+
+    BufK  buf_k  = params.buf_k;
+    BufKK buf_kk = params.buf_kk;
+    BufA  buf_a  = params.buf_a;
+    BufKA buf_ka = params.buf_ka;
+    BufKM buf_km = params.buf_km;
+    BufKL buf_kl = params.buf_kl;
+    BufB  buf_b  = params.buf_b;
+
+    // Phase 1: 计算该 head 的 L2 平方和 sum_j (k_j * k_k_j)^2
+    float local_sq = 0.0;
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        float kk = buf_k.data[base + j] * buf_kk.data[w_base + j];
+        local_sq += kk * kk;
+    }
+    local_sq = subgroupAdd(local_sq);
+    if (sgid == 0) {
+        sketch_sq[sg] = local_sq;
+    }
+    barrier();
+
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sq[index] += sketch_sq[index + step];
+        }
+        barrier();
+    }
+
+    if (index == 0) {
+        inv_norm = 1.0 / max(sqrt(sketch_sq[0]), EPSILON);
+    }
+    barrier();
+
+    // Phase 2: 写回 k_mod / kk_l2 / b
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        uint addr      = base + j;
+        uint waddr     = w_base + j;
+        float k        = buf_k.data[addr];
+        float kk_val   = k * buf_kk.data[waddr];
+        float k_l2     = kk_val * inv_norm;
+        float a        = buf_a.data[addr];
+
+        buf_km.data[addr] = k * (1.0 + buf_ka.data[waddr] * (a - 1.0));
+        buf_kl.data[addr] = k_l2;
+        buf_b.data[addr]  = -k_l2 * a;
+    }
+}

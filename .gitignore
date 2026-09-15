@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Sidecar runtime artifacts (local working dir when running the gateway)
+config.json
+evolution-data/
+auto_state.json
+router_evolution/
+
+# Node bindings
+node_modules/
+bindings/node/*.node
+bindings/node/dist/
+
+# Python
+.venv/
+__pycache__/
+*.pyd
+*.so
+dist/
+wheels/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

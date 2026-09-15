@@ -1,0 +1,109 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint C = 4096;        // Channel size
+
+layout(constant_id = 1) const uint STRIDE_A_X = 1;          // Innermost stride of A
+layout(constant_id = 2) const uint STRIDE_A_Y = 4096;       // Batch stride of A
+
+layout(constant_id = 3) const uint STRIDE_B_X = 1;          // Innermost stride of B
+layout(constant_id = 4) const uint STRIDE_B_Y = 4096;       // Batch stride of B
+
+layout(constant_id = 5) const uint STRIDE_C_X = 1;          // Innermost stride of C
+layout(constant_id = 6) const uint STRIDE_C_Y = 4096;       // Batch stride of C
+
+layout(constant_id = 7) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 8) const uint STRIDE_Y_Y = 4096;       // Batch stride of Y
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+
+const uvec2 STRIDE_A        = uvec2(STRIDE_A_X, STRIDE_A_Y);
+const uvec2 STRIDE_B        = uvec2(STRIDE_B_X, STRIDE_B_Y);
+const uvec2 STRIDE_C        = uvec2(STRIDE_C_X, STRIDE_C_Y);
+const uvec2 STRIDE_Y        = uvec2(STRIDE_Y_X, STRIDE_Y_Y);
+
+// Operation selection via integer OP constant:
+//   1=sigmoid  2=exp  3=tanh  4=neg  5=mul  6=add  7=lerp  8=scale  9=scale_exp  10=mul_neg
+//   (anything else → identity pass-through of A)
+
+layout(buffer_reference) buffer InputA  { I_TYPE data[]; }  input_a;
+layout(buffer_reference) buffer InputB  { I_TYPE data[]; }  input_b;
+layout(buffer_reference) buffer InputC  { I_TYPE data[]; }  input_c;
+layout(buffer_reference) buffer Output  { O_TYPE data[]; }  output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputA  input_a;
+    InputB  input_b;
+    InputC  input_c;
+    Output  output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.x;
+    const uint index                    = gl_LocalInvocationIndex;
+
+    InputA  input_a                     = params.input_a;
+    InputB  input_b                     = params.input_b;
+    InputC  input_c                     = params.input_c;
+    Output  output_y                    = params.output_y;
+
+    const uint a_base                   = batch * STRIDE_A.y;
+    const uint b_base                   = batch * STRIDE_B.y;
+    const uint c_base                   = batch * STRIDE_C.y;
+    const uint y_base                   = batch * STRIDE_Y.y;
+
+    // OP 8/9 consume b[0] as a shared scalar (input_b is a [1] tensor shared across
+    // batch, e.g. scale_w). All threads read the same address; the load is uniform
+    // and collapses to a single memory transaction.
+#if OP == 8 || OP == 9
+    I_TYPE b_scalar = input_b.data[0];
+#endif
+
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        I_TYPE a = input_a.data[a_base + i * STRIDE_A.x];
+        I_TYPE result;
+
+#if OP == 1
+        result = I_TYPE(1.0) / (I_TYPE(1.0) + exp(-a));
+#elif OP == 2
+        result = exp(a);
+#elif OP == 3
+        result = tanh(a);
+#elif OP == 4
+        result = -a;
+#elif OP == 5
+        I_TYPE b = input_b.data[b_base + i * STRIDE_B.x];
+        result = a * b;
+#elif OP == 6
+        I_TYPE b = input_b.data[b_base + i * STRIDE_B.x];
+        result = a + b;
+#elif OP == 7
+        I_TYPE b = input_b.data[b_base + i * STRIDE_B.x];
+        I_TYPE c = input_c.data[c_base + i * STRIDE_C.x];
+        result = a + c * (b - a);
+#elif OP == 8
+        result = a * b_scalar;
+#elif OP == 9
+        result = exp(a * b_scalar);
+#elif OP == 10
+        I_TYPE b = input_b.data[b_base + i * STRIDE_B.x];
+        result = a * (-b);
+#else
+        // Fallback: identity pass-through of A
+        result = a;
+#endif
+
+        output_y.data[y_base + i * STRIDE_Y.x] = O_TYPE(result);
+    }
+}

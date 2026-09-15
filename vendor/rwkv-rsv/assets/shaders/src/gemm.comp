@@ -1,0 +1,328 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// M/N/K values filled out at pipeline creation time
+layout(constant_id = 0) const uint MAT_M = 16;
+layout(constant_id = 1) const uint MAT_N = 16;
+layout(constant_id = 2) const uint MAT_K = 16;
+
+layout(constant_id = 3) const uint TILE_M = 256;
+layout(constant_id = 4) const uint TILE_N = 256;
+layout(constant_id = 5) const uint TILE_K = 64;
+
+layout(constant_id = 6) const uint M = 4096;
+layout(constant_id = 7) const uint N = 4096;
+layout(constant_id = 8) const uint K = 4096;
+
+layout(constant_id = 9)  const uint STRIDE_A_TILE_X = 1;
+layout(constant_id = 10) const uint STRIDE_A_TILE_Y = 4096;
+layout(constant_id = 11) const uint STRIDE_A_TILE_Z = 32;
+layout(constant_id = 12) const uint STRIDE_A_TILE_W = 1048576;
+
+layout(constant_id = 13) const uint STRIDE_B_TILE_X = 1;
+layout(constant_id = 14) const uint STRIDE_B_TILE_Y = 4096;
+layout(constant_id = 15) const uint STRIDE_B_TILE_Z = 32;
+layout(constant_id = 16) const uint STRIDE_B_TILE_W = 1048576;
+
+layout(constant_id = 17) const uint STRIDE_SH_A_TILE_X = 1;
+layout(constant_id = 18) const uint STRIDE_SH_A_TILE_Y = 40;
+layout(constant_id = 19) const uint STRIDE_SH_B_TILE_X = 1;
+layout(constant_id = 20) const uint STRIDE_SH_B_TILE_Y = 40;
+
+layout(constant_id = 21) const uint STRIDE_SH_A_MAT_X = 1;
+layout(constant_id = 22) const uint STRIDE_SH_A_MAT_Y = 40;
+
+layout(constant_id = 23) const uint STRIDE_SH_A_SUBTILE_X = 16;
+layout(constant_id = 24) const uint STRIDE_SH_A_SUBTILE_Y = 640;
+layout(constant_id = 25) const uint STRIDE_SH_A_SUBTILE_Z = 2560;
+
+layout(constant_id = 26) const uint STRIDE_SH_B_MAT_X = 1;
+layout(constant_id = 27) const uint STRIDE_SH_B_MAT_Y = 40;
+
+layout(constant_id = 28) const uint STRIDE_SH_B_SUBTILE_X = 16;
+layout(constant_id = 29) const uint STRIDE_SH_B_SUBTILE_Y = 640;
+layout(constant_id = 30) const uint STRIDE_SH_B_SUBTILE_Z = 5120;
+
+layout(constant_id = 31) const uint STRIDE_C_SUBTILE_X = 1;
+layout(constant_id = 32) const uint STRIDE_C_SUBTILE_Y = 4096;
+layout(constant_id = 33) const uint STRIDE_C_SUBTILE_Z = 16;
+layout(constant_id = 34) const uint STRIDE_C_SUBTILE_W = 65536;
+
+layout(constant_id = 35) const uint STRIDE_C_TILE_X = 64;
+layout(constant_id = 36) const uint STRIDE_C_TILE_Y = 524288;
+layout(constant_id = 37) const uint STRIDE_C_TILE_Z = 256;
+layout(constant_id = 38) const uint STRIDE_C_TILE_W = 1048576;
+
+layout(constant_id = 39) const uint STRIDE_A_BATCH = 0;
+layout(constant_id = 40) const uint STRIDE_B_BATCH = 0;
+layout(constant_id = 41) const uint STRIDE_C_BATCH = 0;
+
+#define DIV_CEIL(A, B)          ((A) + (B) - 1) / (B)
+
+const uint A_BYTES              = A_BITS / 8;
+
+const uint NUM_ELEMENT_VEC4     = 16 / A_BYTES;
+
+const uint NUM_SUBTILE_TILE_M   = 4;
+const uint NUM_SUBTILE_TILE_N   = 2;
+const uint NUM_SUBTILE_TILE     = NUM_SUBTILE_TILE_M * NUM_SUBTILE_TILE_N;
+const uint NUM_INVOKE_SUBTILE   = 32;
+const uint NUM_INVOKE_TILE      = NUM_INVOKE_SUBTILE * NUM_SUBTILE_TILE;
+
+const uint SUBTILE_M            = TILE_M / NUM_SUBTILE_TILE_M;
+const uint SUBTILE_N            = TILE_N / NUM_SUBTILE_TILE_N;
+const uint SUBTILE_K            = TILE_K;
+
+const uint NUM_MAT_SUBTILE_M    = SUBTILE_M / MAT_M;
+const uint NUM_MAT_SUBTILE_N    = SUBTILE_N / MAT_N;
+const uint NUM_MAT_SUBTILE_K    = SUBTILE_K / MAT_K;
+
+const uint NUM_TILE_M           = M / TILE_M;
+const uint NUM_TILE_N           = N / TILE_N;
+const uint NUM_TILE_K           = K / TILE_K;
+
+const uvec4 SHAPE_A_TILE        = uvec4(TILE_K, TILE_M, NUM_TILE_K, NUM_TILE_M);
+const uvec4 SHAPE_B_TILE        = uvec4(TILE_K, TILE_N, NUM_TILE_K, NUM_TILE_N);
+
+const uvec4 STRIDE_A_TILE       = uvec4(STRIDE_A_TILE_X, STRIDE_A_TILE_Y, STRIDE_A_TILE_Z, STRIDE_A_TILE_W);
+const uvec4 STRIDE_B_TILE       = uvec4(STRIDE_B_TILE_X, STRIDE_B_TILE_Y, STRIDE_B_TILE_Z, STRIDE_B_TILE_W);
+
+const uvec2 SHAPE_SH_A_TILE     = uvec2(TILE_K, TILE_M);
+const uvec2 SHAPE_SH_B_TILE     = uvec2(TILE_K, TILE_N);
+
+const uvec2 STRIDE_SH_A_TILE    = uvec2(STRIDE_SH_A_TILE_X, STRIDE_SH_A_TILE_Y);
+const uvec2 STRIDE_SH_B_TILE    = uvec2(STRIDE_SH_B_TILE_X, STRIDE_SH_B_TILE_Y);
+
+const uvec2 SHAPE_SH_A_MAT      = uvec2(MAT_K, MAT_M);
+const uvec2 STRIDE_SH_A_MAT     = uvec2(STRIDE_SH_A_MAT_X, STRIDE_SH_A_MAT_Y);
+
+const uvec3 SHAPE_SH_A_SUBTILE  = uvec3(NUM_MAT_SUBTILE_K, NUM_MAT_SUBTILE_M, NUM_SUBTILE_TILE_M);
+const uvec3 STRIDE_SH_A_SUBTILE = uvec3(STRIDE_SH_A_SUBTILE_X, STRIDE_SH_A_SUBTILE_Y, STRIDE_SH_A_SUBTILE_Z);
+
+const uvec2 SHAPE_SH_B_MAT      = uvec2(MAT_K, MAT_N);
+const uvec2 STRIDE_SH_B_MAT     = uvec2(STRIDE_SH_B_MAT_X, STRIDE_SH_B_MAT_Y);
+
+const uvec3 SHAPE_SH_B_SUBTILE  = uvec3(NUM_MAT_SUBTILE_K, NUM_MAT_SUBTILE_N, NUM_SUBTILE_TILE_N);
+const uvec3 STRIDE_SH_B_SUBTILE = uvec3(STRIDE_SH_B_SUBTILE_X, STRIDE_SH_B_SUBTILE_Y, STRIDE_SH_B_SUBTILE_Z);
+
+const uvec4 SHAPE_C_SUBTILE     = uvec4(MAT_M, MAT_N, NUM_MAT_SUBTILE_M, NUM_MAT_SUBTILE_N);
+const uvec4 STRIDE_C_SUBTILE    = uvec4(STRIDE_C_SUBTILE_X, STRIDE_C_SUBTILE_Y, STRIDE_C_SUBTILE_Z, STRIDE_C_SUBTILE_W);
+
+const uvec4 SHAPE_C_TILE        = uvec4(NUM_SUBTILE_TILE_M, NUM_SUBTILE_TILE_N, NUM_TILE_M, NUM_TILE_N);
+const uvec4 STRIDE_C_TILE       = uvec4(STRIDE_C_TILE_X, STRIDE_C_TILE_Y, STRIDE_C_TILE_Z, STRIDE_C_TILE_W);
+
+const uint SH_A_BUF = TILE_M * (TILE_K + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
+const uint SH_B_BUF = TILE_N * (TILE_K + NUM_ELEMENT_VEC4) / NUM_ELEMENT_VEC4;
+shared uvec4 sh_a[SH_A_BUF];
+shared uvec4 sh_b[SH_B_BUF];
+
+coopmat<C_TYPE, gl_ScopeSubgroup, MAT_M, MAT_N, gl_MatrixUseAccumulator> result[NUM_MAT_SUBTILE_N][NUM_MAT_SUBTILE_M];
+
+layout(buffer_reference) buffer InputA { uvec4 data[]; }    input_a;
+layout(buffer_reference) buffer InputB { uvec4 data[]; }    input_b;
+layout(buffer_reference) buffer InputC { C_TYPE data[]; }   input_c;
+layout(buffer_reference) buffer Output { C_TYPE data[]; }   output_o;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputA input_a;
+    InputB input_b;
+    InputC input_c;
+    Output output_o;
+} params;
+
+layout(local_size_x = NUM_INVOKE_TILE, local_size_y = 1, local_size_z = 1) in;
+
+// Maps a linear index to a multi-dimensional coordinate
+uvec4 layout_iota(uvec4 shape, uint index) {
+    uvec4 coord = uvec4(0);
+    uint prod = shape.x;
+
+    coord.x = index % shape.x;
+    coord.y = (index / prod) % shape.y; prod *= shape.y;
+    coord.z = (index / prod) % shape.z; prod *= shape.z;
+    coord.w = index / prod;
+
+    return coord;
+}
+
+uvec2 layout_iota(uvec2 shape, uint index) {
+    uvec2 coord = uvec2(0);
+
+    coord.x = index % shape.x;
+    coord.y = (index / shape.x) % shape.y;
+
+    return coord;
+}
+
+// Maps a multi-dimensional coordinate to a linear index
+uint layout_index(uvec4 stride, uvec4 coord) {
+    return stride.x * coord.x + stride.y * coord.y + stride.z * coord.z + stride.w * coord.w;
+}
+
+uint layout_index(uvec3 stride, uvec3 coord) {
+    return stride.x * coord.x + stride.y * coord.y + stride.z * coord.z;
+}
+
+uint layout_index(uvec2 stride, uvec2 coord) {
+    return stride.x * coord.x + stride.y * coord.y;
+}
+
+// Maps linear index to multi-dimensional coordinate and then to linear index
+// This is equivalent to layout_index(stride, layout_iota(shape, stride, index))
+uint layout_index_iota(uvec4 shape, uvec4 stride, uint index) {
+    uvec4 coord = layout_iota(shape, index);
+    return layout_index(stride, coord);
+}
+
+void main() {
+    const uint batch            = gl_WorkGroupID.z;
+    const uint tile_m           = gl_WorkGroupID.x;
+    const uint tile_n           = gl_WorkGroupID.y;
+    const uint subtile_m        = layout_iota(uvec2(NUM_SUBTILE_TILE_M, NUM_SUBTILE_TILE_N), gl_SubgroupID).x;
+    const uint subtile_n        = layout_iota(uvec2(NUM_SUBTILE_TILE_M, NUM_SUBTILE_TILE_N), gl_SubgroupID).y;
+    const uint local_index      = gl_LocalInvocationIndex;
+
+    InputA input_a              = params.input_a;
+    InputB input_b              = params.input_b;
+    InputC input_c              = params.input_c;
+    Output output_o             = params.output_o;
+
+    [[unroll]]
+    for (uint i = 0; i < NUM_MAT_SUBTILE_N; ++i) {
+        [[unroll]]
+        for (uint j = 0; j < NUM_MAT_SUBTILE_M; ++j) {
+            result[i][j] = coopmat<C_TYPE, gl_ScopeSubgroup, MAT_M, MAT_N, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    uvec4 local_a[TILE_M * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE];
+    uvec4 local_b[TILE_N * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE];
+
+    // Load A tiles
+    [[unroll]]
+    for (uint i = 0; i < TILE_M * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+        uint index = i * NUM_INVOKE_TILE + local_index;
+        uvec4 coord = uvec4(layout_iota(SHAPE_A_TILE.xy, index * NUM_ELEMENT_VEC4), 0, tile_m);
+        index = layout_index(STRIDE_A_TILE, coord) + STRIDE_A_BATCH * batch;
+        local_a[i] = input_a.data[index / NUM_ELEMENT_VEC4];
+    }
+
+    // Load B tiles
+    [[unroll]]
+    for (uint i = 0; i < TILE_N * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+        uint index = i * NUM_INVOKE_TILE + local_index;
+        uvec4 coord = uvec4(layout_iota(SHAPE_B_TILE.xy, index * NUM_ELEMENT_VEC4), 0, tile_n);
+        index = layout_index(STRIDE_B_TILE, coord) + STRIDE_B_BATCH * batch;
+        local_b[i] = input_b.data[index / NUM_ELEMENT_VEC4];
+    }
+
+    for (uint tile_k = 0; tile_k < NUM_TILE_K; ++tile_k) {
+        bool last = (tile_k + 1 >= NUM_TILE_K);
+
+        barrier();
+
+        [[unroll]]
+        for (uint i = 0; i < TILE_M * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+            uint index = i * NUM_INVOKE_TILE + local_index;
+            uvec2 coord = layout_iota(SHAPE_SH_A_TILE, index * NUM_ELEMENT_VEC4);
+            sh_a[layout_index(STRIDE_SH_A_TILE, coord) / NUM_ELEMENT_VEC4] = local_a[i];
+        }
+
+        [[unroll]]
+        for (uint i = 0; i < TILE_N * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+            uint index = i * NUM_INVOKE_TILE + local_index;
+            uvec2 coord = layout_iota(SHAPE_SH_B_TILE, index * NUM_ELEMENT_VEC4);
+            sh_b[layout_index(STRIDE_SH_B_TILE, coord) / NUM_ELEMENT_VEC4] = local_b[i];
+        }
+
+        barrier();
+
+        // Prefetch next A tiles
+        [[unroll]]
+        for (uint i = 0; i < TILE_M * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+            uint index = i * NUM_INVOKE_TILE + local_index;
+            uvec4 coord = uvec4(layout_iota(SHAPE_A_TILE.xy, index * NUM_ELEMENT_VEC4), tile_k + 1, tile_m);
+            index = layout_index(STRIDE_A_TILE, coord) + STRIDE_A_BATCH * batch;
+            if (!last) local_a[i] = input_a.data[index / NUM_ELEMENT_VEC4];
+        }
+
+        // Prefetch next B tiles
+        [[unroll]]
+        for (uint i = 0; i < TILE_N * TILE_K / NUM_ELEMENT_VEC4 / NUM_INVOKE_TILE; ++i) {
+            uint index = i * NUM_INVOKE_TILE + local_index;
+            uvec4 coord = uvec4(layout_iota(SHAPE_B_TILE.xy, index * NUM_ELEMENT_VEC4), tile_k + 1, tile_n);
+            index = layout_index(STRIDE_B_TILE, coord) + STRIDE_B_BATCH * batch;
+            if (!last) local_b[i] = input_b.data[index / NUM_ELEMENT_VEC4];
+        }
+
+        // The actual computation
+        [[unroll]]
+        for (uint mat_k = 0; mat_k < NUM_MAT_SUBTILE_K; ++mat_k) {
+            coopmat<A_TYPE, gl_ScopeSubgroup, MAT_M, MAT_K, gl_MatrixUseA> mat_a[NUM_MAT_SUBTILE_M];
+
+            [[unroll]]
+            for (uint mat_m = 0; mat_m < NUM_MAT_SUBTILE_M; ++mat_m) {
+                uvec3 coord = uvec3(mat_k, mat_m, subtile_m);
+                // sh_a 为 uvec4（8 个 f16），coopMatLoad 的 offset/stride 以 buffer 元素单位计，故除以 NUM_ELEMENT_VEC4。
+                coopMatLoad(mat_a[mat_m], sh_a, layout_index(STRIDE_SH_A_SUBTILE, coord) / NUM_ELEMENT_VEC4, STRIDE_SH_A_MAT.y / NUM_ELEMENT_VEC4, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            coopmat<A_TYPE, gl_ScopeSubgroup, MAT_K, MAT_N, gl_MatrixUseB> mat_b;
+
+            [[unroll]]
+            for (uint mat_n = 0; mat_n < NUM_MAT_SUBTILE_N; ++mat_n) {
+                uvec3 coord = uvec3(mat_k, mat_n, subtile_n);
+                coopMatLoad(mat_b, sh_b, layout_index(STRIDE_SH_B_SUBTILE, coord) / NUM_ELEMENT_VEC4, STRIDE_SH_B_MAT.y / NUM_ELEMENT_VEC4, gl_CooperativeMatrixLayoutColumnMajor);
+
+                [[unroll]]
+                for (uint mat_m = 0; mat_m < NUM_MAT_SUBTILE_M; ++mat_m) {
+                    result[mat_n][mat_m] = coopMatMulAdd(mat_a[mat_m], mat_b, result[mat_n][mat_m]);
+                }
+            }
+        }
+    }
+
+    [[unroll]]
+    for (uint mat_n = 0; mat_n < NUM_MAT_SUBTILE_N; ++mat_n) {
+#if defined(AFFINE)
+        coopmat<C_TYPE, gl_ScopeSubgroup, MAT_M, MAT_N, gl_MatrixUseAccumulator> mat_c;
+#endif
+
+        [[unroll]]
+        for (uint mat_m = 0; mat_m < NUM_MAT_SUBTILE_M; ++mat_m) {
+            uvec4 coord_0 = uvec4(subtile_m, subtile_n, tile_m, tile_n);
+            uvec2 coord_1 = uvec2(mat_m, mat_n);
+            uint index = layout_index(STRIDE_C_TILE, coord_0) + layout_index(STRIDE_C_SUBTILE.zw, coord_1) + STRIDE_C_BATCH * batch;
+
+#if defined(AFFINE)
+            // 残差 x 与输出 C 均为 [M, N] 行主序，故 coopMatLoad 须用 RowMajor 且 stride = N，
+            // 才能把残差正确地加到对应 (i, j) 位置（ColumnMajor 会转置残差导致结果错误）。
+            coopMatLoad(mat_c, input_c.data, index, STRIDE_C_SUBTILE.y, gl_CooperativeMatrixLayoutRowMajor);
+            result[mat_n][mat_m] = result[mat_n][mat_m] + mat_c;
+#endif
+
+#if defined(ACTIVATION)
+            [[unroll]]
+            for (uint i = 0; i < result[mat_n][mat_m].length(); ++i) {
+                C_TYPE val = result[mat_n][mat_m][i];
+#if ACTIVATION == 1
+                val = max(val, C_TYPE(0));
+                val = val * val;
+#endif
+#if ACTIVATION == 2
+                val = tanh(val);
+#endif
+                result[mat_n][mat_m][i] = val;
+            }
+#endif
+
+            coopMatStore(result[mat_n][mat_m], output_o.data, index, STRIDE_C_SUBTILE.y, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

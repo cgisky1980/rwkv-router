@@ -1,0 +1,130 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint H = 1;            // Number of heads
+layout(constant_id = 1) const uint N = 64;           // Head size
+
+layout(constant_id = 2) const uint STRIDE_S_X = 1;          // Innermost stride of S (j axis)
+layout(constant_id = 3) const uint STRIDE_S_Y = 64;         // Stride along i axis of S
+layout(constant_id = 4) const uint STRIDE_S_Z = 4096;       // Stride along h axis of S
+layout(constant_id = 5) const uint STRIDE_S_W = 4096;       // Batch stride of S
+
+layout(constant_id = 6) const uint STRIDE_V_X = 1;          // Innermost stride of r/w/k/v/a/b/y
+layout(constant_id = 7) const uint STRIDE_V_Y = 64;         // Stride along h axis of r/w/k/v/a/b/y
+layout(constant_id = 8) const uint STRIDE_V_Z = 64;         // Batch stride of r/w/k/v/a/b/y
+
+// Compile-time constants
+// BLOCK_SIZE is fixed to the default head size; the shader assumes N == BLOCK_SIZE.
+// For different head sizes, rebuild a shader variant with a matching BLOCK_SIZE.
+const uint BLOCK_SIZE       = 64;
+
+const uvec4 STRIDE_S        = uvec4(STRIDE_S_X, STRIDE_S_Y, STRIDE_S_Z, STRIDE_S_W);
+const uvec3 STRIDE_V        = uvec3(STRIDE_V_X, STRIDE_V_Y, STRIDE_V_Z);
+
+// Each workgroup processes one head (an N x N block of S). One thread per row i.
+//
+//   Phase 1: sa[i] = sum_j S[i,j] * a[j]
+//   Phase 2+3 fused:
+//     S[i,j] = S[i,j]*w[j] + sa[i]*b[j] + v[i]*k[j]   (in-place update of S)
+//     y[i]  += S[i,j] * r[j]                          (y is overwritten, accumulated from 0)
+
+shared I_TYPE sh_a[BLOCK_SIZE];
+shared I_TYPE sh_w[BLOCK_SIZE];
+shared I_TYPE sh_b[BLOCK_SIZE];
+shared I_TYPE sh_k[BLOCK_SIZE];
+shared I_TYPE sh_r[BLOCK_SIZE];
+shared I_TYPE sa[BLOCK_SIZE];
+
+layout(buffer_reference) buffer BufS  { I_TYPE data[]; }  buf_s;
+layout(buffer_reference) buffer BufR  { I_TYPE data[]; }  buf_r;
+layout(buffer_reference) buffer BufW  { I_TYPE data[]; }  buf_w;
+layout(buffer_reference) buffer BufK  { I_TYPE data[]; }  buf_k;
+layout(buffer_reference) buffer BufV  { I_TYPE data[]; }  buf_v;
+layout(buffer_reference) buffer BufA  { I_TYPE data[]; }  buf_a;
+layout(buffer_reference) buffer BufB  { I_TYPE data[]; }  buf_b;
+layout(buffer_reference) buffer BufY  { O_TYPE data[]; }  buf_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufS  buf_s;
+    BufR  buf_r;
+    BufW  buf_w;
+    BufK  buf_k;
+    BufV  buf_v;
+    BufA  buf_a;
+    BufB  buf_b;
+    BufY  buf_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.z;
+    const uint head                     = gl_WorkGroupID.x;
+    const uint i                        = gl_LocalInvocationID.x;
+
+    if (i >= N) {
+        return;
+    }
+
+    BufS buf_s                          = params.buf_s;
+    BufR buf_r                          = params.buf_r;
+    BufW buf_w                          = params.buf_w;
+    BufK buf_k                          = params.buf_k;
+    BufV buf_v                          = params.buf_v;
+    BufA buf_a                          = params.buf_a;
+    BufB buf_b                          = params.buf_b;
+    BufY buf_y                          = params.buf_y;
+
+    const uint s_base                   = batch * STRIDE_S.w + head * STRIDE_S.z;
+    const uint v_base                   = batch * STRIDE_V.z + head * STRIDE_V.y;
+
+    const uint s_row_base               = s_base + i * STRIDE_S.y;
+    const uint v_elem                   = v_base + i * STRIDE_V.x;
+
+    // Cooperatively load the per-head vectors into shared memory.
+    // One thread per element (BLOCK_SIZE == N).
+    sh_a[i] = buf_a.data[v_elem];
+    sh_w[i] = buf_w.data[v_elem];
+    sh_b[i] = buf_b.data[v_elem];
+    sh_k[i] = buf_k.data[v_elem];
+    sh_r[i] = buf_r.data[v_elem];
+
+    // v[i] is private to thread i; keep it in a register.
+    I_TYPE v_i = buf_v.data[v_elem];
+
+    barrier();
+
+    // Phase 1: sa[i] = sum_j S[i,j] * a[j]
+    I_TYPE sa_i = I_TYPE(0.0);
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        I_TYPE s_ij = buf_s.data[s_row_base + j * STRIDE_S.x];
+        sa_i = fma(s_ij, sh_a[j], sa_i);
+    }
+    sa[i] = sa_i;
+
+    barrier();
+
+    // Phase 2+3 fused (read sa[i] from shared memory per spec):
+    //   S[i,j] = S[i,j]*w[j] + sa[i]*b[j] + v[i]*k[j]
+    //   y[i]  += S[i,j] * r[j]
+    I_TYPE sa_val = sa[i];
+    I_TYPE y_i = I_TYPE(0.0);
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        I_TYPE s_ij = buf_s.data[s_row_base + j * STRIDE_S.x];
+        I_TYPE new_s = s_ij * sh_w[j] + sa_val * sh_b[j] + v_i * sh_k[j];
+        buf_s.data[s_row_base + j * STRIDE_S.x] = new_s;
+        y_i = fma(new_s, sh_r[j], y_i);
+    }
+
+    // Overwrite y[i] with the accumulated S@r product.
+    buf_y.data[v_elem] = O_TYPE(y_i);
+}

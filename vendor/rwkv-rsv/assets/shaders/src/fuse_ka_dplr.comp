@@ -1,0 +1,130 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合 fuse_ka + dplr → 1 次 dispatch（单 token 路径）。
+// 每个 workgroup 处理一个 (batch, head)，BLOCK_SIZE == N（每线程一行）。
+//   Phase 0: L2 范数 inv_norm = 1/sqrt(sum_j (k_j*k_k_j)^2)
+//   Phase 1: 计算 k_mod_i = k_i*(1+k_a_i*(a_i-1))、kk_l2_i=(k_i*k_k_i)*inv_norm、b_i=-kk_l2_i*a_i，
+//            并加载 w、r 入 shared，v 存寄存器。
+//   Phase 2: sa[i] = sum_j S[i,j] * kk_l2[j]
+//   Phase 3: S[i,j] = S[i,j]*w[j] + sa[i]*b[j] + v[i]*k_mod[j]；y[i] = sum_j S[i,j]*r[j]
+// 相比 fuse_ka + dplr 两次 dispatch，省 1 次/层。
+// 注意：k、a、r、v、w、y 为 [batch, H*N]（batch 偏移）；k_k、k_a 为共享 [H*N]（无 batch）。
+
+layout(constant_id = 0) const uint H = 1;
+layout(constant_id = 1) const uint N = 64;
+layout(constant_id = 2) const float EPSILON = 1e-12;
+
+const uint BLOCK_SIZE = 64;
+
+shared float sh_a[BLOCK_SIZE]; // kk_l2
+shared float sh_b[BLOCK_SIZE]; // b_vec
+shared float sh_k[BLOCK_SIZE]; // k_mod
+shared float sh_w[BLOCK_SIZE]; // w
+shared float sh_r[BLOCK_SIZE]; // r
+shared float sa[BLOCK_SIZE];
+shared float sq[BLOCK_SIZE];   // L2 归约缓冲
+
+layout(buffer_reference) buffer BufS  { float data[]; }  buf_s;
+layout(buffer_reference) buffer BufK  { float data[]; }  buf_k;   // k
+layout(buffer_reference) buffer BufKK { float data[]; }  buf_kk;  // k_k
+layout(buffer_reference) buffer BufA  { float data[]; }  buf_a;   // a
+layout(buffer_reference) buffer BufKA { float data[]; }  buf_ka;  // k_a
+layout(buffer_reference) buffer BufR  { float data[]; }  buf_r;   // r
+layout(buffer_reference) buffer BufV  { float data[]; }  buf_v;   // v
+layout(buffer_reference) buffer BufW  { float data[]; }  buf_w;   // w
+layout(buffer_reference) buffer BufKM { float data[]; }  buf_km;  // k_mod (out)
+layout(buffer_reference) buffer BufY  { float data[]; }  buf_y;   // y
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufS  buf_s;
+    BufK  buf_k;
+    BufKK buf_kk;
+    BufA  buf_a;
+    BufKA buf_ka;
+    BufR  buf_r;
+    BufV  buf_v;
+    BufW  buf_w;
+    BufKM buf_km;
+    BufY  buf_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch = gl_WorkGroupID.z;
+    const uint head  = gl_WorkGroupID.x;
+    const uint i     = gl_LocalInvocationID.x;
+    if (i >= N) {
+        return;
+    }
+
+    BufS  buf_s  = params.buf_s;
+    BufK  buf_k  = params.buf_k;
+    BufKK buf_kk = params.buf_kk;
+    BufA  buf_a  = params.buf_a;
+    BufKA buf_ka = params.buf_ka;
+    BufR  buf_r  = params.buf_r;
+    BufV  buf_v  = params.buf_v;
+    BufW  buf_w  = params.buf_w;
+    BufKM buf_km = params.buf_km;
+    BufY  buf_y  = params.buf_y;
+
+    const uint v_base = batch * (H * N) + head * N;
+    const uint w_base = head * N;
+    const uint s_base = batch * (H * N * N) + head * (N * N);
+    const uint s_row_base = s_base + i * N;
+
+    // Phase 0: L2 范数
+    float k_i  = buf_k.data[v_base + i];
+    float kk_i = k_i * buf_kk.data[w_base + i];
+    float a_i  = buf_a.data[v_base + i];
+    sq[i] = kk_i * kk_i;
+    barrier();
+    for (uint step = BLOCK_SIZE >> 1; step > 0; step >>= 1) {
+        if (i < step) {
+            sq[i] += sq[i + step];
+        }
+        barrier();
+    }
+    float inv_norm = 1.0 / max(sqrt(sq[0]), EPSILON);
+
+    // Phase 1: 计算 k_mod / kk_l2 / b，加载 w、r
+    float k_l2 = kk_i * inv_norm;
+    float k_mod = k_i * (1.0 + buf_ka.data[w_base + i] * (a_i - 1.0));
+    sh_a[i] = k_l2;
+    sh_b[i] = -k_l2 * a_i;
+    sh_k[i] = k_mod;
+    sh_w[i] = buf_w.data[v_base + i];
+    sh_r[i] = buf_r.data[v_base + i];
+    buf_km.data[v_base + i] = k_mod; // 供 norm_sum_rk_rk 使用
+    float v_i = buf_v.data[v_base + i];
+    barrier();
+
+    // Phase 2: sa[i] = sum_j S[i,j] * sh_a[j]
+    float sa_i = 0.0;
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        sa_i = fma(buf_s.data[s_row_base + j], sh_a[j], sa_i);
+    }
+    sa[i] = sa_i;
+    barrier();
+
+    // Phase 3: 更新 S 并计算 y
+    float sa_val = sa[i];
+    float y_i = 0.0;
+    [[unroll]]
+    for (uint j = 0; j < N; ++j) {
+        float s_ij = buf_s.data[s_row_base + j];
+        float new_s = s_ij * sh_w[j] + sa_val * sh_b[j] + v_i * sh_k[j];
+        buf_s.data[s_row_base + j] = new_s;
+        y_i = fma(new_s, sh_r[j], y_i);
+    }
+    buf_y.data[v_base + i] = y_i;
+}

@@ -1,0 +1,173 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// int8 gemv：权重 A 为 int8 非对称 per-group 量化（256 级均匀，无 LUT），输入 X f32，输出 Y f32。
+// 单 token decode 路径把权重带宽降到 fp16 的一半（1 byte/权重）。
+//
+// int8 格式（W[M, K] 行主序，K 为收缩维，group=128）：
+//   idx: uint8 [M, K]   每权重 1 字节（0..255）
+//   sz:  uint32 [M, K/128] 每元素 = (scale: fp16 低16位 | zero: fp16 高16位)
+// 反量化：w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]
+//
+// 与 gemv_any4.comp 同构：ROWS=4 行/workgroup 复用 X，subgroupAdd + shared 树归约。
+// 差异：每线程每迭代读 1 个 uint32（4 个 uint8 权重，4B vs fp16 的 8B），无 LUT 查表。
+// 要求 K % 128 == 0、K % 4 == 0、M % ROWS == 0。
+
+layout(constant_id = 0) const uint M = 4096;        // Number of output elements
+layout(constant_id = 1) const uint K = 4096;        // Contraction dimension
+
+layout(constant_id = 2) const uint STRIDE_A_X = 1;          // Innermost stride of A (fp16 单位)
+layout(constant_id = 3) const uint STRIDE_A_Y = 4096;       // Stride along M axis of A (fp16 单位 = K)
+layout(constant_id = 4) const uint STRIDE_A_Z = 16777216;   // Batch stride of A (fp16 单位 = M*K)
+
+layout(constant_id = 5) const uint STRIDE_B_X = 1;          // Innermost stride of B
+layout(constant_id = 6) const uint STRIDE_B_Y = 4096;       // Batch stride of B
+
+layout(constant_id = 7) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 8) const uint STRIDE_X_Y = 4096;       // Batch stride of X
+
+layout(constant_id = 9) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 10) const uint STRIDE_Y_Y = 4096;      // Batch stride of Y
+
+const uint BLOCK_SIZE       = 128;
+layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV               = K / 4;    // 4 个 uint8 权重打包为 1 个 uint32
+const uint KG               = K / 128;  // 每行 group 数（group=128）
+const uint ROWS             = 4;        // 每个 workgroup 处理的行数（M % ROWS == 0）
+const uint ROW_IDX          = STRIDE_A_Y / 4;  // 行步长（uint32 idx 单位）
+
+const uvec2 STRIDE_B        = uvec2(STRIDE_B_X, STRIDE_B_Y);
+const uvec2 STRIDE_X        = uvec2(STRIDE_X_X, STRIDE_X_Y);
+const uvec2 STRIDE_Y        = uvec2(STRIDE_Y_X, STRIDE_Y_Y);
+
+shared float sketch_dot[ROWS][NUM_SUBGROUPS];
+// 本组 4 行的 scale/zero（解包为 f32 对）
+shared float s_scale[ROWS][KG];
+shared float s_zero[ROWS][KG];
+
+layout(buffer_reference) buffer InputIdx { uint data[]; }      input_idx; // uint8 打包为 uint32
+layout(buffer_reference) buffer InputSZ  { uint data[]; }      input_sz;
+layout(buffer_reference) buffer InputB   { float data[]; }     input_b;
+layout(buffer_reference) buffer InputX   { vec4 data[]; }      input_x;
+layout(buffer_reference) buffer Output   { float data[]; }     output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputIdx input_idx;
+    InputSZ  input_sz;
+    InputB   input_b;
+    InputX   input_x;
+    Output   output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.y;
+    const uint wg_row                   = gl_WorkGroupID.x;
+    const uint first_row                = wg_row * ROWS;
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    InputIdx input_idx                  = params.input_idx;
+    InputSZ  input_sz                   = params.input_sz;
+    InputB   input_b                    = params.input_b;
+    InputX   input_x                    = params.input_x;
+    Output   output_y                   = params.output_y;
+
+    const uint a_base = batch * (STRIDE_A_Z / 4) + first_row * ROW_IDX;
+    const uint x_base = batch * (STRIDE_X.y / 4);
+
+    // Phase 0: 协作加载本组 ROWS 行的 scale/zero 到 shared。
+    if (index < ROWS * 16) {
+        // 无 LUT，仅加载 scale/zero
+    }
+    [[unroll]]
+    for (uint i = index; i < ROWS * KG; i += BLOCK_SIZE) {
+        const uint r = i / KG;
+        const uint g = i % KG;
+        const vec2 szv = unpackFloat2x16(input_sz.data[(first_row + r) * KG + g]);
+        s_scale[r][g] = szv.x;
+        s_zero[r][g] = szv.y;
+    }
+    barrier();
+
+    // Phase 1: 为 ROWS 行各维护独立累加器，同一 K 循环内并行读 ROWS 行权重 + 复用 X。
+    // 每次迭代每行读 1 个 uint32（4 个 uint8 权重）+ 1 个 vec4（4 个 f32）X。
+    float acc[ROWS];
+    for (uint r = 0; r < ROWS; r++) acc[r] = 0.0;
+
+    [[unroll]]
+    for (uint k = index; k < KV; k += BLOCK_SIZE) {
+        vec4 xv = input_x.data[x_base + k];
+        const uint g = k / 32;   // 每 group 128 权重 = 32 个 uint32
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            const uint ipack = input_idx.data[a_base + r * ROW_IDX + k];
+            const float sc = s_scale[r][g];
+            const float zr = s_zero[r][g];
+            const float b0 = float(ipack & 0xFFu);
+            const float b1 = float((ipack >> 8) & 0xFFu);
+            const float b2 = float((ipack >> 16) & 0xFFu);
+            const float b3 = float(ipack >> 24);
+            acc[r] += (sc * b0 + zr) * xv.x
+                    + (sc * b1 + zr) * xv.y
+                    + (sc * b2 + zr) * xv.z
+                    + (sc * b3 + zr) * xv.w;
+        }
+    }
+
+    // Subgroup-level reduction
+    [[unroll]]
+    for (uint r = 0; r < ROWS; r++) {
+        float v = subgroupAdd(acc[r]);
+        if (subgroup_invocation_id == 0) {
+            sketch_dot[r][subgroup_id] = v;
+        }
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            if (index < step) {
+                sketch_dot[r][index] += sketch_dot[r][index + step];
+            }
+        }
+        barrier();
+    }
+
+    if (index == 0) {
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            float result = sketch_dot[r][0];
+
+#if defined(AFFINE)
+            result = result + float(input_b.data[batch * STRIDE_B.y + (first_row + r) * STRIDE_B.x]);
+#endif
+
+#if defined(ACTIVATION)
+#if ACTIVATION == 1
+            result = max(result, 0.0);
+            result = result * result;
+#endif
+#if ACTIVATION == 2
+            result = tanh(result);
+#endif
+#endif
+
+            output_y.data[batch * STRIDE_Y.y + (first_row + r) * STRIDE_Y.x] = result;
+        }
+    }
+}

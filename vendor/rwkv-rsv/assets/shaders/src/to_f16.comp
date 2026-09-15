@@ -1,0 +1,52 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// f32 → f16 转换（sequence-parallel，token 并行）。
+// 输入 [T, C] f32，输出 [T, C] f16，每个 workgroup 处理一个 token。
+// 用于把 fp32 激活转换为 fp16，供 tensor-core GEMM（fp32io16 模式）使用。
+
+layout(constant_id = 0) const uint C = 4096;        // 每 token 通道数
+layout(constant_id = 1) const uint T = 1;           // 序列长度
+layout(constant_id = 2) const uint STRIDE_X = 4096; // 输入 token 步长
+layout(constant_id = 3) const uint STRIDE_Y = 4096; // 输出 token 步长
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer Input  { float data[]; }    input_x;
+layout(buffer_reference) buffer Output { float16_t data[]; } output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Input input_x;
+    Output output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint token = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationID.x;
+    const uint yb = token * STRIDE_Y;
+
+    // 先把 buffer_reference 复制到局部变量（GLSL 中直接访问 uniform 成员引用不可靠）。
+    Input  input_x  = params.input_x;
+    Output output_y = params.output_y;
+
+    // 非对齐 token（token >= T）写 0，用于补齐 M 到 TILE_M 倍数，保证 tensor-core GEMM 填充行输出为 0。
+    if (token >= T) {
+        for (uint i = index; i < C; i += BLOCK_SIZE) {
+            output_y.data[yb + i] = float16_t(0.0);
+        }
+        return;
+    }
+    const uint xb = token * STRIDE_X;
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        output_y.data[yb + i] = float16_t(input_x.data[xb + i]);
+    }
+}

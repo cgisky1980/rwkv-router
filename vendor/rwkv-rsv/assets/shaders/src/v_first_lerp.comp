@@ -1,0 +1,56 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// v_first 混合（sequence-parallel）：
+//   v[t] = v[t] + gate[t] * (v_first[t] - v[t])
+// 所有 token（含 t=0）都要混合：layer>0 时 v_first[t] 来自 layer 0 在第 t 个 token 的 v，
+// 与单 token 路径一致（该路径下 layer>0 的 v 也会被 v_first 混合）。
+// 每个 workgroup 处理一个 token；线程循环 C 个通道。
+//
+// 注意：在 sequence-parallel 中 v_first 是 [T, C]（每个 token 各自来自 layer 0 的 v），
+// 必须按 token 索引，而非单 token 路径中共享的 [C]。
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint T = 1;
+
+layout(constant_id = 2) const uint STRIDE_V = 4096;   // Token stride of v / gate / v_first
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer BufV  { float data[]; }  buf_v;   // [T, C] in/out
+layout(buffer_reference) buffer BufG  { float data[]; }  buf_g;   // [T, C] gate
+layout(buffer_reference) buffer BufVF { float data[]; }  buf_vf;  // [T, C] v_first
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufV  buf_v;
+    BufG  buf_g;
+    BufVF buf_vf;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint token = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationID.x;
+
+    if (token >= T) {
+        return;
+    }
+
+    BufV  buf_v  = params.buf_v;
+    BufG  buf_g  = params.buf_g;
+    BufVF buf_vf = params.buf_vf;
+
+    const uint base = token * STRIDE_V;
+
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        float vv = buf_v.data[base + i];
+        float g  = buf_g.data[base + i];
+        float vf = buf_vf.data[base + i];
+        buf_v.data[base + i] = vv + g * (vf - vv);
+    }
+}

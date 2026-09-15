@@ -1,0 +1,67 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Token shift + time-mix interpolation for one [T, C] vector (sequence-parallel).
+//
+//   x[t]  : [C] per token, token t's activation
+//   prev  : x[t-1] for t>0, or the per-layer token-shift state (input_s) for t=0
+//   tm    : per-layer time-mix factor [C] (shared across tokens)
+//   result[t] = x[t] + tm * (prev - x[t])
+//
+// This is exactly the batched form of the single-token elementwise_lerp(x, prev_x, tm).
+// Each workgroup handles one token; threads loop over C.
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint T = 1;
+
+layout(constant_id = 2) const uint STRIDE_X_Y = 4096;  // Token stride of X
+layout(constant_id = 3) const uint STRIDE_Y_Y = 4096;  // Token stride of Y
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer InputX  { I_TYPE data[]; }  input_x;
+layout(buffer_reference) buffer InputS  { I_TYPE data[]; }  input_s;   // token-shift state [C]
+layout(buffer_reference) buffer TimeMix { I_TYPE data[]; }  time_mix;  // [C] shared across tokens
+layout(buffer_reference) buffer Output  { O_TYPE data[]; }  output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputX  input_x;
+    InputS  input_s;
+    TimeMix time_mix;
+    Output  output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint token = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationID.x;
+    if (token >= T) {
+        return;
+    }
+
+    InputX  input_x  = params.input_x;
+    InputS  input_s  = params.input_s;
+    TimeMix time_mix = params.time_mix;
+    Output  output_y = params.output_y;
+
+    const uint x_base = token * STRIDE_X_Y;
+    const uint y_base = token * STRIDE_Y_Y;
+
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        I_TYPE cur = input_x.data[x_base + i * 1u];
+        I_TYPE prev;
+        if (token == 0u) {
+            prev = input_s.data[i * 1u];
+        } else {
+            prev = input_x.data[x_base - STRIDE_X_Y + i * 1u];
+        }
+        I_TYPE tm = time_mix.data[i * 1u];
+        I_TYPE result = cur + tm * (prev - cur);
+        output_y.data[y_base + i * 1u] = O_TYPE(result);
+    }
+}

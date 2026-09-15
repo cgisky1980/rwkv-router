@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rwkv-router"
+version = "0.1.0"
+description = "Self-evolving RWKV smart router (R0-R3 tiering + AdamW fine-tuning loop) — Python bindings"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["rwkv", "llm", "router", "ai", "inference"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.maturin]
+# lib crate-name `rwkv_router` -> module `rwkv_router.pyd/.so`.
+bindings = "pyo3"

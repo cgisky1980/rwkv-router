@@ -1,0 +1,161 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// fp32io16 gemv + 残差累加：y = acc + (x[.*g]) @ A。
+// 单 token 路径：把 add_inplace 残差折叠进 gemv 输出写，省一次独立 dispatch。
+// MUL=1：y = acc + (x .* g) @ A（output gemv，x=y_norm, g=g, acc=x）
+// MUL=0：y = acc + x @ A          （ffn_value gemv，x=r2, acc=x）
+// 权重 A 为 fp16，输入 x/acc 为 f32，输出 y 为 f32，累加用 f32。g 为 fp16（MUL=1 时作为乘数）。
+//
+// 向量化：A 以 uint64 一次加载 4 个 fp16，X/G 以 vec4 一次加载 4 个 f32。要求 K % 4 == 0。
+//
+// 多行优化：每个 workgroup 处理 ROWS 行（默认 4），独立累加器提升 ILP 隐藏内存延迟。
+// 要求 M % ROWS == 0。
+//
+// 2026-08-09 曾尝试 subgroup-per-row 重构（同 chain4 模式，320wg/无 barrier）：A/B 两轮
+// 同窗口归一化均打平或略劣（K=2560 时旧形态 2.5 迭代×4 行累加器已有足够 ILP，与 chain4
+// 的 K=96~320 过并行场景不同），已回退。勿再沿此方向重复尝试。
+
+// Pipeline constants
+layout(constant_id = 0) const uint M = 4096;        // Number of output elements
+layout(constant_id = 1) const uint K = 4096;        // Contraction dimension
+
+layout(constant_id = 2) const uint STRIDE_A_X = 1;          // Innermost stride of A
+layout(constant_id = 3) const uint STRIDE_A_Y = 4096;       // Stride along M axis of A
+layout(constant_id = 4) const uint STRIDE_A_Z = 16777216;   // Batch stride of A
+
+layout(constant_id = 5) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 6) const uint STRIDE_X_Y = 4096;       // Batch stride of X
+
+layout(constant_id = 7) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 8) const uint STRIDE_Y_Y = 4096;       // Batch stride of Y
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 128;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=11），不能写死 32（AMD=64，Intel 可变）。
+// 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（128 % 32/64/16 均整除）。
+layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV               = K / 8;   // 8 个 fp16 打包为两个 uint64（16 字节/次加载）
+const uint ROWS             = 4;       // 每个 workgroup 处理的行数（M % ROWS == 0）
+
+const uvec3 STRIDE_A        = uvec3(STRIDE_A_X, STRIDE_A_Y, STRIDE_A_Z);
+const uvec2 STRIDE_X        = uvec2(STRIDE_X_X, STRIDE_X_Y);
+const uvec2 STRIDE_Y        = uvec2(STRIDE_Y_X, STRIDE_Y_Y);
+
+shared float sketch_dot[ROWS][NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer InputA  { uint64_t data[]; }  input_a;
+layout(buffer_reference) buffer InputX  { vec4 data[]; }      input_x;
+layout(buffer_reference) buffer InputG  { uint data[]; }       input_g; // fp16 打包（每 uint 2 个 fp16）
+layout(buffer_reference) buffer InputAcc{ float data[]; }     input_acc;
+layout(buffer_reference) buffer Output  { float data[]; }     output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputA  input_a;
+    InputX  input_x;
+    InputG  input_g;
+    InputAcc input_acc;
+    Output  output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.y;
+    const uint wg_row                   = gl_WorkGroupID.x;     // which block of ROWS rows
+    const uint first_row                = wg_row * ROWS;
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    InputA  input_a                     = params.input_a;
+    InputX  input_x                     = params.input_x;
+    InputG  input_g                     = params.input_g;
+    InputAcc input_acc                  = params.input_acc;
+    Output  output_y                    = params.output_y;
+
+    const uint a_base = batch * (STRIDE_A.z / 4) + first_row * (STRIDE_A.y / 4);
+    const uint x_base = batch * (STRIDE_X.y / 4);
+
+    // Phase 1: 为 ROWS 行各维护独立累加器，同一 K 循环内并行读 ROWS 行权重 + 复用 X。
+    float acc[ROWS];
+    for (uint r = 0; r < ROWS; r++) acc[r] = 0.0;
+
+    [[unroll]]
+    for (uint k = index; k < KV; k += BLOCK_SIZE) {
+        vec4 xv0  = input_x.data[x_base + 2 * k];
+        vec4 xv1  = input_x.data[x_base + 2 * k + 1];
+#if MUL == 1
+        uint g0   = input_g.data[2 * (x_base + 2 * k)];
+        uint g1   = input_g.data[2 * (x_base + 2 * k) + 1];
+        uint g2   = input_g.data[2 * (x_base + 2 * k) + 2];
+        uint g3   = input_g.data[2 * (x_base + 2 * k) + 3];
+        vec2 gv0  = unpackFloat2x16(g0);
+        vec2 gv1  = unpackFloat2x16(g1);
+        vec2 gv2  = unpackFloat2x16(g2);
+        vec2 gv3  = unpackFloat2x16(g3);
+#endif
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            uint64_t raw0 = input_a.data[a_base + r * (STRIDE_A.y / 4) + 2 * k];
+            uint64_t raw1 = input_a.data[a_base + r * (STRIDE_A.y / 4) + 2 * k + 1];
+            uint32_t lo0  = uint32_t(raw0 & 0xFFFFFFFFu);
+            uint32_t hi0  = uint32_t(raw0 >> 32u);
+            uint32_t lo1  = uint32_t(raw1 & 0xFFFFFFFFu);
+            uint32_t hi1  = uint32_t(raw1 >> 32u);
+            vec2 a00 = unpackFloat2x16(lo0);
+            vec2 a01 = unpackFloat2x16(hi0);
+            vec2 a10 = unpackFloat2x16(lo1);
+            vec2 a11 = unpackFloat2x16(hi1);
+#if MUL == 1
+            acc[r] += a00.x * (xv0.x * gv0.x) + a00.y * (xv0.y * gv0.y)
+                    + a01.x * (xv0.z * gv1.x) + a01.y * (xv0.w * gv1.y)
+                    + a10.x * (xv1.x * gv2.x) + a10.y * (xv1.y * gv2.y)
+                    + a11.x * (xv1.z * gv3.x) + a11.y * (xv1.w * gv3.y);
+#else
+            acc[r] += a00.x * xv0.x + a00.y * xv0.y + a01.x * xv0.z + a01.y * xv0.w
+                    + a10.x * xv1.x + a10.y * xv1.y + a11.x * xv1.z + a11.y * xv1.w;
+#endif
+        }
+    }
+
+    // Subgroup-level reduction（每行独立）
+    [[unroll]]
+    for (uint r = 0; r < ROWS; r++) {
+        float v = subgroupAdd(acc[r]);
+        if (subgroup_invocation_id == 0) {
+            sketch_dot[r][subgroup_id] = v;
+        }
+    }
+    barrier();
+
+    // Cross-subgroup reduction（每行独立，但共享 barrier）
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            if (index < step) {
+                sketch_dot[r][index] += sketch_dot[r][index + step];
+            }
+        }
+        barrier();
+    }
+
+    // Write results: y = acc + dot（残差累加）
+    if (index == 0) {
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            uint y_ofs = batch * STRIDE_Y.y + (first_row + r) * STRIDE_Y.x;
+            output_y.data[y_ofs] = input_acc.data[y_ofs] + sketch_dot[r][0];
+        }
+    }
+}

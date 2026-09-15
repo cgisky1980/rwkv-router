@@ -1,0 +1,137 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合 r/k/v 三个 C×C gemv（fp16 权重、f32 输入/输出、f32 累加）为 1 次 dispatch。
+// 每个 workgroup 处理一行（row），同时算 r[row]/k[row]/v[row] 三个输出。
+// dispatch: (M, 1, 1)。相对 3 次独立 gemv_f32io 省 2 次 dispatch + 2 次 barrier。
+//
+// 向量化：A 以 uint64 一次加载 4 个 fp16，X 以 vec4 一次加载 4 个 f32。要求 K % 4 == 0。
+
+// Pipeline constants
+layout(constant_id = 0) const uint M = 4096;        // Number of output elements
+layout(constant_id = 1) const uint K = 4096;        // Contraction dimension
+
+layout(constant_id = 2) const uint STRIDE_A_X = 1;          // Innermost stride of A
+layout(constant_id = 3) const uint STRIDE_A_Y = 4096;       // Stride along M axis of A
+
+layout(constant_id = 4) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 5) const uint STRIDE_X_Y = 4096;       // Batch stride of X
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=6），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 6) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV               = K / 4;
+
+const uvec2 STRIDE_A        = uvec2(STRIDE_A_X, STRIDE_A_Y);
+const uvec2 STRIDE_X        = uvec2(STRIDE_X_X, STRIDE_X_Y);
+
+shared float sketch_dot_r[NUM_SUBGROUPS];
+shared float sketch_dot_k[NUM_SUBGROUPS];
+shared float sketch_dot_v[NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer InputAr  { uint64_t data[]; }  input_ar;
+layout(buffer_reference) buffer InputAk  { uint64_t data[]; }  input_ak;
+layout(buffer_reference) buffer InputAv  { uint64_t data[]; }  input_av;
+layout(buffer_reference) buffer InputXr  { vec4 data[]; }      input_xr;
+layout(buffer_reference) buffer InputXk  { vec4 data[]; }      input_xk;
+layout(buffer_reference) buffer InputXv  { vec4 data[]; }      input_xv;
+layout(buffer_reference) buffer OutputR  { float data[]; }     output_r;
+layout(buffer_reference) buffer OutputK  { float data[]; }     output_k;
+layout(buffer_reference) buffer OutputV  { float data[]; }     output_v;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputAr  input_ar;
+    InputAk  input_ak;
+    InputAv  input_av;
+    InputXr  input_xr;
+    InputXk  input_xk;
+    InputXv  input_xv;
+    OutputR  output_r;
+    OutputK  output_k;
+    OutputV  output_v;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint row                      = gl_WorkGroupID.x;     // which output element (row of A)
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    InputAr  input_ar                   = params.input_ar;
+    InputAk  input_ak                   = params.input_ak;
+    InputAv  input_av                   = params.input_av;
+    InputXr  input_xr                   = params.input_xr;
+    InputXk  input_xk                   = params.input_xk;
+    InputXv  input_xv                   = params.input_xv;
+    OutputR  output_r                   = params.output_r;
+    OutputK  output_k                   = params.output_k;
+    OutputV  output_v                   = params.output_v;
+
+    const uint a_base = row * (STRIDE_A.y / 4);
+
+    // Phase 1: 三个点积 r/k/v = A[row, :] · X[:]
+    float local_r = 0.0;
+    float local_k = 0.0;
+    float local_v = 0.0;
+    [[unroll]]
+    for (uint k = index; k < KV; k += BLOCK_SIZE) {
+        uint64_t raw_r = input_ar.data[a_base + k * STRIDE_A.x];
+        uint64_t raw_k = input_ak.data[a_base + k * STRIDE_A.x];
+        uint64_t raw_v = input_av.data[a_base + k * STRIDE_A.x];
+        vec2 ar02 = unpackFloat2x16(uint32_t(raw_r & 0xFFFFFFFFu));
+        vec2 ar24 = unpackFloat2x16(uint32_t(raw_r >> 32u));
+        vec2 ak02 = unpackFloat2x16(uint32_t(raw_k & 0xFFFFFFFFu));
+        vec2 ak24 = unpackFloat2x16(uint32_t(raw_k >> 32u));
+        vec2 av02 = unpackFloat2x16(uint32_t(raw_v & 0xFFFFFFFFu));
+        vec2 av24 = unpackFloat2x16(uint32_t(raw_v >> 32u));
+        vec4 xrv = input_xr.data[k];
+        vec4 xkv = input_xk.data[k];
+        vec4 xvv = input_xv.data[k];
+        local_r += ar02.x * xrv.x + ar02.y * xrv.y + ar24.x * xrv.z + ar24.y * xrv.w;
+        local_k += ak02.x * xkv.x + ak02.y * xkv.y + ak24.x * xkv.z + ak24.y * xkv.w;
+        local_v += av02.x * xvv.x + av02.y * xvv.y + av24.x * xvv.z + av24.y * xvv.w;
+    }
+
+    // Subgroup-level reduction
+    local_r = subgroupAdd(local_r);
+    local_k = subgroupAdd(local_k);
+    local_v = subgroupAdd(local_v);
+
+    // Write subgroup results to shared memory
+    if (subgroup_invocation_id == 0) {
+        sketch_dot_r[subgroup_id] = local_r;
+        sketch_dot_k[subgroup_id] = local_k;
+        sketch_dot_v[subgroup_id] = local_v;
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_dot_r[index] += sketch_dot_r[index + step];
+            sketch_dot_k[index] += sketch_dot_k[index + step];
+            sketch_dot_v[index] += sketch_dot_v[index + step];
+        }
+        barrier();
+    }
+
+    // Write results
+    if (index == 0) {
+        output_r.data[row] = sketch_dot_r[0];
+        output_k.data[row] = sketch_dot_k[0];
+        output_v.data[row] = sketch_dot_v[0];
+    }
+}

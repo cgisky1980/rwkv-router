@@ -1,0 +1,121 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint C = 4096;        // Channel size
+layout(constant_id = 1) const uint T = 1;           // Number of tokens
+
+layout(constant_id = 2) const uint STRIDE_X_X = 1;          // Channel stride of X
+layout(constant_id = 3) const uint STRIDE_X_Y = 4096;       // Token stride of X
+layout(constant_id = 4) const uint STRIDE_X_Z = 4096;       // Batch stride of X
+
+layout(constant_id = 5) const uint STRIDE_S_X = 1;          // Channel stride of S
+layout(constant_id = 6) const uint STRIDE_S_Y = 4096;       // State stride of S
+layout(constant_id = 7) const uint STRIDE_S_Z = 4096;       // Batch stride of S
+
+layout(constant_id = 8) const uint STRIDE_Y_X = 1;          // Channel stride of Y
+layout(constant_id = 9) const uint STRIDE_Y_Y = 4096;       // Token stride of Y
+layout(constant_id = 10) const uint STRIDE_Y_Z = 4096;      // Batch stride of Y
+
+layout(constant_id = 11) const uint STRIDE_T_X = 1;         // Channel stride of T (time_mix)
+layout(constant_id = 12) const uint STRIDE_T_Y = 4096;      // Token stride of T (time_mix)
+layout(constant_id = 13) const uint STRIDE_T_Z = 4096;      // Batch stride of T (time_mix)
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+const uvec3 STRIDE_X        = uvec3(STRIDE_X_X, STRIDE_X_Y, STRIDE_X_Z);
+const uvec3 STRIDE_S        = uvec3(STRIDE_S_X, STRIDE_S_Y, STRIDE_S_Z);
+const uvec3 STRIDE_Y        = uvec3(STRIDE_Y_X, STRIDE_Y_Y, STRIDE_Y_Z);
+const uvec3 STRIDE_T        = uvec3(STRIDE_T_X, STRIDE_T_Y, STRIDE_T_Z);
+
+layout(buffer_reference) buffer InputX   { I_TYPE data[]; }  input_x;
+layout(buffer_reference) buffer InputS   { I_TYPE data[]; }  input_s;
+layout(buffer_reference) buffer TimeMix  { I_TYPE data[]; }  time_mix;
+layout(buffer_reference) buffer Cursors  { uint data[]; }    cursors;
+layout(buffer_reference) buffer Output   { O_TYPE data[]; }  output_o;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputX  input_x;
+    InputS  input_s;
+    TimeMix time_mix;
+    Cursors cursors;
+    Output  output_o;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+struct Cursor {
+    uint state;
+    uint token;
+    uint len;
+};
+
+// Decompresses a cursor packed as: state (8 bits) | token (16 bits) | len (8 bits)
+Cursor unpack_cursor(uint packed) {
+    Cursor cursor;
+    cursor.state    = packed & 0xffu;             // State ID of the current sequence
+    cursor.token    = (packed >> 8u) & 0xffffu;   // Token ID of the current sequence
+    cursor.len      = (packed >> 24u) & 0xffu;    // Length of the current sequence
+    return cursor;
+}
+
+void main() {
+    const uint invocation_index = gl_LocalInvocationIndex;
+    const uint batch            = gl_WorkGroupID.z;
+    const uint token            = gl_WorkGroupID.y;
+    const uint index            = gl_WorkGroupID.x * BLOCK_SIZE + invocation_index;
+
+    if (index >= C || token >= T) {
+        return;
+    }
+
+    // Decode cursor for this workgroup
+    Cursor cursor = unpack_cursor(params.cursors.data[token]);
+
+    InputX  input_x     = params.input_x;
+    InputS  input_s     = params.input_s;
+    TimeMix time_mix    = params.time_mix;
+    Output  output_o    = params.output_o;
+
+    // Compute base offsets
+    const uint x_base   = batch * STRIDE_X.z + token * STRIDE_X.y;
+    const uint s_base   = batch * STRIDE_S.z + cursor.state * STRIDE_S.y;
+    const uint y_base   = batch * STRIDE_Y.z + token * STRIDE_Y.y;
+    const uint t_base   = batch * STRIDE_T.z + token * STRIDE_T.y;
+
+    // Token shift with time-mix interpolation
+    I_TYPE value = input_x.data[x_base + index * STRIDE_X.x];
+
+    // Load time-mix factor
+    I_TYPE factor = time_mix.data[t_base + index * STRIDE_T.x];
+
+    // Token shift logic
+    I_TYPE result;
+#ifdef REVERSED
+    if (cursor.token == 0u) {
+        // first token: interpolate with sx (previous state)
+        I_TYPE s_val = input_s.data[s_base + index * STRIDE_S.x];
+        result = mix(value, s_val, factor);
+    } else {
+        // subsequent tokens: interpolate with previous token
+        I_TYPE prev = input_x.data[x_base - STRIDE_X.y + index * STRIDE_X.x];
+        result = mix(value, prev, factor);
+    }
+#else
+    if (cursor.token == 0u) {
+        // first token: interpolate sx with current value
+        I_TYPE s_val = input_s.data[s_base + index * STRIDE_S.x];
+        result = mix(s_val, value, factor);
+    } else {
+        // subsequent tokens: interpolate previous token with current
+        I_TYPE prev = input_x.data[x_base - STRIDE_X.y + index * STRIDE_X.x];
+        result = mix(prev, value, factor);
+    }
+#endif
+
+    output_o.data[y_base + index * STRIDE_Y.x] = O_TYPE(result);
+}

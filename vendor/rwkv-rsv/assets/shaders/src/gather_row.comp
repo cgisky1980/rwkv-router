@@ -1,0 +1,37 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 参数化 embedding gather：从 src 表 [VOCAB, C] 按 token 索引 buffer 读，gather 一行到 dst [C]。
+// 索引来自 GPU buffer（tok[0]，f32 位模式存 uint），使本循环体不依赖具体 token 值，
+// 为 GPU self-loop（批量提交、无 CPU 每 token 交换）铺路：argmax 结果直接写 tok，
+// 下一轮 gather 自动跟随，无需 CPU 回读/回传。
+//
+// dispatch (ceil(C/256), 1, 1)。
+
+layout(constant_id = 0) const uint C = 2560; // 行宽（通道数）
+
+layout(buffer_reference) buffer InTok  { float data[]; } in_tok;   // [1] 当前 token 索引
+layout(buffer_reference) buffer InSrc  { float data[]; } in_src;   // [VOCAB, C] 预计算 embedding
+layout(buffer_reference) buffer OutDst { float data[]; } out_dst;  // [C]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InTok  in_tok;
+    InSrc  in_src;
+    OutDst out_dst;
+} params;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+    const uint idx   = floatBitsToUint(params.in_tok.data[0]);
+    const uint base  = idx * C;
+    [[unroll]]
+    for (uint i = index; i < C; i += 256) {
+        params.out_dst.data[i] = params.in_src.data[base + i];
+    }
+}

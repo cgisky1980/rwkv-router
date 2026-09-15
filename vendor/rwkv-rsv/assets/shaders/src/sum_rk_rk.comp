@@ -1,0 +1,86 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// sum_rk_rk（对标 albatross）：
+//   给定 r、k_mod、r_k、v（均为 [H*N]），对每个 head h 计算
+//     s = sum_j r[j] * k_mod[j] * r_k[j]      （N 个元素归约）
+//   并将 y[j] += s * v[j]                      （累加到 y，替代 CPU 端 add_vec）
+//   消除原来 download → CPU 循环 → upload 的 PCIe 往返。
+
+layout(constant_id = 0) const uint H = 1;      // Number of heads
+layout(constant_id = 1) const uint N = 64;     // Head size
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=2），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float scratch[NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer BufR  { float data[]; }  input_r;   // r
+layout(buffer_reference) buffer BufK  { float data[]; }  input_k;   // k_mod
+layout(buffer_reference) buffer BufRK { float data[]; }  input_rk;  // r_k
+layout(buffer_reference) buffer BufV  { float data[]; }  input_v;   // v
+layout(buffer_reference) buffer BufY  { float data[]; }  inout_y;   // y (acc)
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    BufR  input_r;
+    BufK  input_k;
+    BufRK input_rk;
+    BufV  input_v;
+    BufY  inout_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch  = gl_WorkGroupID.y;
+    const uint head   = gl_WorkGroupID.x;
+    const uint index  = gl_LocalInvocationIndex;
+    const uint sg     = gl_SubgroupID;
+    const uint sgid   = gl_SubgroupInvocationID;
+    const uint base   = batch * (H * N) + head * N;
+
+    BufR  input_r  = params.input_r;
+    BufK  input_k  = params.input_k;
+    BufRK input_rk = params.input_rk;
+    BufV  input_v  = params.input_v;
+    BufY  inout_y  = params.inout_y;
+
+    // Phase 1: 计算该 head 的 s = sum_j r[j]*k[j]*r_k[j]
+    // r/k/v 为 [T, H*N]（batch 偏移），r_k 为共享 [H, N]（仅 head 偏移）
+    float local = 0.0;
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        local += input_r.data[base + j]
+               * input_k.data[base + j]
+               * input_rk.data[head * N + j];
+    }
+
+    local = subgroupAdd(local);
+    if (sgid == 0) {
+        scratch[sg] = local;
+    }
+    barrier();
+
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            scratch[index] += scratch[index + step];
+        }
+        barrier();
+    }
+
+    const float s = scratch[0];
+    barrier();
+
+    // Phase 2: y[j] += s * v[j]
+    for (uint j = index; j < N; j += BLOCK_SIZE) {
+        inout_y.data[base + j] += s * input_v.data[base + j];
+    }
+}

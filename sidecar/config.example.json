@@ -1,0 +1,22 @@
+{
+  "tiers": {
+    "R0": { "upstream": "builtin-rwkv", "model": "models/rwkv-0.1b.st", "tokenizer": "models/vocab.json" },
+    "R1": { "upstream": "builtin-rwkv", "model": "models/rwkv-0.1b.st", "tokenizer": "models/vocab.json" },
+    "R2": { "upstream": "openai", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY" },
+    "R3": { "upstream": "anthropic", "base_url": "https://api.anthropic.com", "model": "claude-sonnet-4-5", "api_key_env": "ANTHROPIC_API_KEY" }
+  },
+  "fallback": { "upstream": "openai", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY" },
+  "router": {
+    "classifier": { "model": "models/rwkv-0.1b.st", "vocab": "models/vocab.json", "head": "models/router_head_0b.json", "timeout_ms": 500 },
+    "generation": { "max_loaded_models": 2 }
+  },
+  "server": { "host": "127.0.0.1", "port": 21750 },
+  "evolution": {
+    "data_dir": "evolution-data",
+    "packs_dir": "packs",
+    "head_path": "models/router_head_0b.json",
+    "capture_limit": 2000,
+    "min_labeled_for_evolve": 20,
+    "auto_evolve_step": 50
+  }
+}

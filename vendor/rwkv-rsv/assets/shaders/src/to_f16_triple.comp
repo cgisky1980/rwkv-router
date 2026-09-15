@@ -1,0 +1,75 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// f32 → f16 三输入融合转换（sequence-parallel，token 并行）。
+// 输入三个 [T, C] f32（xr, xk, xv），输出三个 [M_PAD, C] f16（xr16, xk16, xv16），
+// 每个 workgroup 处理一个 token，同时转换三个输入，减少三次 kernel launch 开销。
+// 用于 RWKV-7 time-mixing 的 r/k/v 投影，供 tensor-core GEMM（fp32io16 模式）使用。
+
+layout(constant_id = 0) const uint C = 4096;        // 每 token 通道数
+layout(constant_id = 1) const uint T = 1;           // 序列长度
+layout(constant_id = 2) const uint STRIDE_X = 4096; // 输入 token 步长（三个输入相同）
+layout(constant_id = 3) const uint STRIDE_Y = 4096; // 输出 token 步长（三个输出相同）
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer InputXr  { float data[]; }    input_xr;
+layout(buffer_reference) buffer InputXk  { float data[]; }    input_xk;
+layout(buffer_reference) buffer InputXv  { float data[]; }    input_xv;
+layout(buffer_reference) buffer OutputYr { float16_t data[]; } output_yr;
+layout(buffer_reference) buffer OutputYk { float16_t data[]; } output_yk;
+layout(buffer_reference) buffer OutputYv { float16_t data[]; } output_yv;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputXr  input_xr;
+    InputXk  input_xk;
+    InputXv  input_xv;
+    OutputYr output_yr;
+    OutputYk output_yk;
+    OutputYv output_yv;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint token = gl_WorkGroupID.x;
+    const uint index = gl_LocalInvocationID.x;
+    const uint yr_b = token * STRIDE_Y;
+    const uint yk_b = token * STRIDE_Y;
+    const uint yv_b = token * STRIDE_Y;
+
+    // 先把 buffer_reference 复制到局部变量
+    InputXr  input_xr  = params.input_xr;
+    InputXk  input_xk  = params.input_xk;
+    InputXv  input_xv  = params.input_xv;
+    OutputYr output_yr = params.output_yr;
+    OutputYk output_yk = params.output_yk;
+    OutputYv output_yv = params.output_yv;
+
+    // 非对齐 token（token >= T）写 0，用于补齐 M 到 TILE_M 倍数
+    if (token >= T) {
+        for (uint i = index; i < C; i += BLOCK_SIZE) {
+            output_yr.data[yr_b + i] = float16_t(0.0);
+            output_yk.data[yk_b + i] = float16_t(0.0);
+            output_yv.data[yv_b + i] = float16_t(0.0);
+        }
+        return;
+    }
+
+    const uint xr_b = token * STRIDE_X;
+    const uint xk_b = token * STRIDE_X;
+    const uint xv_b = token * STRIDE_X;
+
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        output_yr.data[yr_b + i] = float16_t(input_xr.data[xr_b + i]);
+        output_yk.data[yk_b + i] = float16_t(input_xk.data[xk_b + i]);
+        output_yv.data[yv_b + i] = float16_t(input_xv.data[xv_b + i]);
+    }
+}

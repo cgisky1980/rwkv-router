@@ -1,0 +1,124 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Pipeline constants
+layout(constant_id = 0) const uint M = 4096;        // Number of output elements
+layout(constant_id = 1) const uint K = 4096;        // Contraction dimension
+
+layout(constant_id = 2) const uint STRIDE_A_X = 1;          // Innermost stride of A
+layout(constant_id = 3) const uint STRIDE_A_Y = 4096;       // Stride along M axis of A
+layout(constant_id = 4) const uint STRIDE_A_Z = 16777216;   // Batch stride of A
+
+layout(constant_id = 5) const uint STRIDE_B_X = 1;          // Innermost stride of B
+layout(constant_id = 6) const uint STRIDE_B_Y = 4096;       // Batch stride of B
+
+layout(constant_id = 7) const uint STRIDE_X_X = 1;          // Innermost stride of X
+layout(constant_id = 8) const uint STRIDE_X_Y = 4096;       // Batch stride of X
+
+layout(constant_id = 9) const uint STRIDE_Y_X = 1;          // Innermost stride of Y
+layout(constant_id = 10) const uint STRIDE_Y_Y = 4096;      // Batch stride of Y
+
+// Compile-time constants
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=11），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 11) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+const uvec3 STRIDE_A        = uvec3(STRIDE_A_X, STRIDE_A_Y, STRIDE_A_Z);
+const uvec2 STRIDE_B        = uvec2(STRIDE_B_X, STRIDE_B_Y);
+const uvec2 STRIDE_X        = uvec2(STRIDE_X_X, STRIDE_X_Y);
+const uvec2 STRIDE_Y        = uvec2(STRIDE_Y_X, STRIDE_Y_Y);
+
+shared I_TYPE   sketch_dot[NUM_SUBGROUPS];
+
+layout(buffer_reference) buffer InputA  { I_TYPE data[]; }  input_a;
+layout(buffer_reference) buffer InputB  { I_TYPE data[]; }  input_b;
+layout(buffer_reference) buffer InputX  { I_TYPE data[]; }  input_x;
+layout(buffer_reference) buffer Output  { O_TYPE data[]; }  output_y;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputA  input_a;
+    InputB  input_b;
+    InputX  input_x;
+    Output  output_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint batch                    = gl_WorkGroupID.y;
+    const uint row                      = gl_WorkGroupID.x;     // which output element (row of A)
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    InputA  input_a                     = params.input_a;
+    InputB  input_b                     = params.input_b;
+    InputX  input_x                     = params.input_x;
+    Output  output_y                    = params.output_y;
+
+    // A has layout (K, M, batch) with small axis first:
+    //   element at (k, m, b) is at offset k + STRIDE_A_Y * m + STRIDE_A_Z * b
+    // X has layout (K, batch) with small axis first:
+    //   element at (k, b) is at offset k + b * STRIDE_X_Y
+    // Y has layout (M, batch) with small axis first:
+    //   element at (m, b) is at offset m + b * STRIDE_Y_Y
+
+    const uint a_base = batch * STRIDE_A.z + row * STRIDE_A.y;
+    const uint x_base = batch * STRIDE_X.y;
+
+    // Phase 1: Compute dot product of A[row, :] and X[:]
+    I_TYPE local_dot = I_TYPE(0.0);
+    [[unroll]]
+    for (uint k = index; k < K; k += BLOCK_SIZE) {
+        I_TYPE a_val = input_a.data[a_base + k * STRIDE_A.x];
+        I_TYPE x_val = input_x.data[x_base + k * STRIDE_X.x];
+        local_dot += a_val * x_val;
+    }
+
+    // Subgroup-level reduction
+    local_dot = subgroupAdd(local_dot);
+
+    // Write subgroup result to shared memory
+    if (subgroup_invocation_id == 0) {
+        sketch_dot[subgroup_id] = local_dot;
+    }
+    barrier();
+
+    // Cross-subgroup reduction
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_dot[index] += sketch_dot[index + step];
+        }
+        barrier();
+    }
+
+    // Write result
+    if (index == 0) {
+        I_TYPE result = sketch_dot[0];
+
+#if defined(AFFINE)
+        result = result + input_b.data[batch * STRIDE_B.y + row * STRIDE_B.x];
+#endif
+
+#if defined(ACTIVATION)
+#if ACTIVATION == 1
+        result = max(result, I_TYPE(0.0));
+        result = result * result;
+#endif
+#if ACTIVATION == 2
+        result = tanh(result);
+#endif
+#endif
+
+        output_y.data[batch * STRIDE_Y.y + row * STRIDE_Y.x] = O_TYPE(result);
+    }
+}

@@ -1,0 +1,140 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 融合 4 条低秩链第二级（w2/a2/g2/v2）→ 1 次 dispatch。
+// **subgroup-per-row**：每个 subgroup 处理一个输出行，每 workgroup 处理
+// NUM_SUBGROUPS = BLOCK_SIZE/SUBGROUP_SIZE 行（2080Ti: 256/32=8 行），
+// dispatch (M / NUM_SUBGROUPS, 1, 1)。
+// ⚠ 行映射双锚点：row = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID，
+//    runtime.rs `gemv_lowrank_chain4` 的 dispatch 网格必须与此同源（2026-08-09 教训：
+//    单边改产生静默错误）。相比 1 行/wg 旧形态：x 读 8 行共享（L1）、
+//    subgroupAdd 一次归约免 shared 往返、wg 数 2560→320。
+// 相比 4 次独立 gemv_lowrank_chain，省 3 次 dispatch/层。
+//
+// 同时计算：
+//   w：out = exp(scale * sigmoid(xw @ W2 + w0))                       [K_W, scale, w0]
+//   a：out = sigmoid(xa @ A2 + a0)                                    [K_A, a0]
+//   v：out = v + sigmoid(xv @ V2 + v0) * (v_first - v)（原地写 v）    [K_V, v0, v_first]
+//   g：out = sigmoid(xg) @ G2                                        [K_G]（sigmoid 作用于 mid，无 bias）
+
+layout(constant_id = 0) const uint M   = 4096;  // 输出维度（C）
+layout(constant_id = 1) const uint K_W = 96;    // w 链 mid 维度
+layout(constant_id = 2) const uint K_A = 96;    // a 链 mid 维度
+layout(constant_id = 3) const uint K_V = 64;    // v 链 mid 维度
+layout(constant_id = 4) const uint K_G = 320;   // g 链 mid 维度
+
+const uint BLOCK_SIZE    = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=5），不能写死 32（AMD=64，Intel 可变）。
+// 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（256 % 32/64/16 均整除）。
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS = BLOCK_SIZE / SUBGROUP_SIZE;
+
+layout(buffer_reference) buffer InW2 { float data[]; };
+layout(buffer_reference) buffer InA2 { float data[]; };
+layout(buffer_reference) buffer InV2 { float data[]; };
+layout(buffer_reference) buffer InG2 { float data[]; };
+layout(buffer_reference) buffer InXW { float data[]; };
+layout(buffer_reference) buffer InXA { float data[]; };
+layout(buffer_reference) buffer InXV { float data[]; };
+layout(buffer_reference) buffer InXG { float data[]; };
+layout(buffer_reference) buffer InW0 { float data[]; };
+layout(buffer_reference) buffer InA0 { float data[]; };
+layout(buffer_reference) buffer InV0 { float data[]; };
+layout(buffer_reference) buffer InScale { float data[]; };
+layout(buffer_reference) buffer InVFirst { float16_t data[]; };
+layout(buffer_reference) buffer OutW { float16_t data[]; };
+layout(buffer_reference) buffer OutA { float16_t data[]; };
+layout(buffer_reference) buffer OutV { float16_t data[]; };
+layout(buffer_reference) buffer OutG { float16_t data[]; };
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InW2     in_w2;
+    InA2     in_a2;
+    InV2     in_v2;
+    InG2     in_g2;
+    InXW     in_xw;
+    InXA     in_xa;
+    InXV     in_xv;
+    InXG     in_xg;
+    InW0     in_w0;
+    InA0     in_a0;
+    InV0     in_v0;
+    InScale  in_scale;
+    InVFirst in_v_first;
+    OutW     out_w;
+    OutA     out_a;
+    OutV     out_v;
+    OutG     out_g;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    // ⚠ 行映射锚点（与 runtime dispatch 同源）：每 wg 覆盖 NUM_SUBGROUPS 个连续行。
+    const uint row  = gl_WorkGroupID.x * NUM_SUBGROUPS + gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+
+    InW2     in_w2     = params.in_w2;
+    InA2     in_a2     = params.in_a2;
+    InV2     in_v2     = params.in_v2;
+    InG2     in_g2     = params.in_g2;
+    InXW     in_xw     = params.in_xw;
+    InXA     in_xa     = params.in_xa;
+    InXV     in_xv     = params.in_xv;
+    InXG     in_xg     = params.in_xg;
+    InW0     in_w0     = params.in_w0;
+    InA0     in_a0     = params.in_a0;
+    InV0     in_v0     = params.in_v0;
+    InScale  in_scale  = params.in_scale;
+    InVFirst in_v_first = params.in_v_first;
+    OutW     out_w     = params.out_w;
+    OutA     out_a     = params.out_a;
+    OutV     out_v     = params.out_v;
+    OutG     out_g     = params.out_g;
+
+    // 4 条链点积：lane 跨步覆盖 K（K_* 均整除 SUBGROUP_SIZE=32；64 位 subgroup 时循环界自动兜底）。
+    // 同 wg 8 个 subgroup 读同一组 x → L1 命中；权重按 lane 连续 → 合并访存。
+    float lw = 0.0, la = 0.0, lv = 0.0, lg = 0.0;
+    [[unroll]]
+    for (uint k = lane; k < K_W; k += SUBGROUP_SIZE) {
+        lw += in_xw.data[k] * in_w2.data[row * K_W + k];
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_A; k += SUBGROUP_SIZE) {
+        la += in_xa.data[k] * in_a2.data[row * K_A + k];
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_V; k += SUBGROUP_SIZE) {
+        lv += in_xv.data[k] * in_v2.data[row * K_V + k];
+    }
+    [[unroll]]
+    for (uint k = lane; k < K_G; k += SUBGROUP_SIZE) {
+        lg += sigmoid(in_xg.data[k]) * in_g2.data[row * K_G + k];
+    }
+
+    // subgroup 内一次归约（无 shared、无 barrier；各 subgroup 行互不重叠，无需 wg 同步）
+    lw = subgroupAdd(lw);
+    la = subgroupAdd(la);
+    lv = subgroupAdd(lv);
+    lg = subgroupAdd(lg);
+
+    // 输出变换
+    if (lane == 0) {
+        out_w.data[row] = float16_t(exp(in_scale.data[0] * sigmoid(lw + in_w0.data[row])));
+        out_a.data[row] = float16_t(sigmoid(la + in_a0.data[row]));
+        float vcur = float(out_v.data[row]);
+        out_v.data[row] = float16_t(vcur + sigmoid(lv + in_v0.data[row]) * (float(in_v_first.data[row]) - vcur));
+        out_g.data[row] = float16_t(lg);
+    }
+}

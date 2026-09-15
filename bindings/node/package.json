@@ -1,0 +1,36 @@
+{
+  "name": "rwkv-router",
+  "version": "0.1.0",
+  "description": "Self-evolving RWKV smart router (R0-R3 tiering + AdamW fine-tuning loop) — Node.js bindings",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "keywords": [
+    "rwkv",
+    "llm",
+    "router",
+    "ai",
+    "napi",
+    "native"
+  ],
+  "files": [
+    "index.d.ts",
+    "index.js",
+    "*.node"
+  ],
+  "napi": {
+    "binaryName": "rwkv-router",
+    "packageName": "rwkv-router",
+    "packageJSONPath": "./package.json"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3"
+  }
+}

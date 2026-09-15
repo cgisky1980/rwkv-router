@@ -1,0 +1,39 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// C[M,N]（行主序）加偏置向量 bias[N]：C[m,n] += bias[n]。
+// 适用于 tensor-core GEMM 输出应用仿射偏置（低秩投影第二级），避免依赖
+// coopmat 内部下标布局（其 [i] 访问按硬件 tiled 布局，非行主序，无法用 i%N 推断列）。
+
+layout(constant_id = 0) const uint M = 64;   // 行数（已补齐）
+layout(constant_id = 1) const uint N = 2560; // 列数
+layout(constant_id = 2) const uint STRIDE_C = 2560; // C 行主序行步长（= N）
+
+layout(buffer_reference) buffer Cbuf { float32_t data[]; } cbuf;
+layout(buffer_reference) buffer Bbuf { float32_t data[]; } bbuf;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    Cbuf c;
+    Bbuf b;
+} params;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint total = M * N;
+    const uint group = gl_WorkGroupID.x;
+    const uint lane  = gl_LocalInvocationIndex;
+    const uint idx   = group * 256 + lane;
+
+    Cbuf c = params.c;
+    Bbuf b = params.b;
+
+    if (idx >= total) return;
+
+    const uint m = idx / N;
+    const uint n = idx % N;
+    c.data[m * STRIDE_C + n] += b.data[n];
+}

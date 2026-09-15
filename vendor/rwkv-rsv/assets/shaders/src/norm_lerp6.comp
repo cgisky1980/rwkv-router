@@ -1,0 +1,144 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 深度融合：ln1 = layer_norm(x, ln1_w, ln1_b) + 6 次 lerp(xr/xw/xk/xv/xa/xg) + state.tmix_x 写回。
+// 单 token（batch=1, H=1）路径，一个 kernel 完成原先 9 次 dispatch。
+// lerp 公式：out = a + c*(b - a)，其中 a=ln1, b=prev_x(state.tmix_x), c=对应 x_* 系数。
+//
+// 并行化：dispatch 网格为 (ceil(C/BLOCK_SIZE), 1, 1)，每个 workgroup 负责 C 的一个片段。
+// 归约冗余：每个 workgroup 独立对全 C 计算 mean/inv_std（x 仅 10KB，命中 L2，开销可忽略），
+// 再将 apply 并行铺到多个 workgroup / 多个 SM。相比单 workgroup（只用 1 个 SM、8 warp），
+// 本版本大幅提升延迟隐藏与占用率。
+
+layout(constant_id = 0) const uint C = 4096;    // Hidden size
+layout(constant_id = 1) const float EPSILON = 1e-5;
+
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=2），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_sum[NUM_SUBGROUPS];
+shared float sketch_sq_sum[NUM_SUBGROUPS];
+shared float mean;
+shared float inv_std;
+
+layout(buffer_reference) buffer InputX  { float data[]; } input_x;
+layout(buffer_reference) buffer State   { float data[]; } state;   // prev_x 读 + tmix_x 写回
+layout(buffer_reference) buffer Gamma   { float data[]; } gamma;   // ln1_w
+layout(buffer_reference) buffer Beta    { float data[]; } beta;    // ln1_b
+layout(buffer_reference) buffer CoeffR  { float data[]; } x_r;
+layout(buffer_reference) buffer CoeffW  { float data[]; } x_w;
+layout(buffer_reference) buffer CoeffK  { float data[]; } x_k;
+layout(buffer_reference) buffer CoeffV  { float data[]; } x_v;
+layout(buffer_reference) buffer CoeffA  { float data[]; } x_a;
+layout(buffer_reference) buffer CoeffG  { float data[]; } x_g;
+layout(buffer_reference) buffer OutR    { float data[]; } o_r;
+layout(buffer_reference) buffer OutW    { float data[]; } o_w;
+layout(buffer_reference) buffer OutK    { float data[]; } o_k;
+layout(buffer_reference) buffer OutV    { float data[]; } o_v;
+layout(buffer_reference) buffer OutA    { float data[]; } o_a;
+layout(buffer_reference) buffer OutG    { float data[]; } o_g;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputX  input_x;
+    State   state;
+    Gamma   gamma;
+    Beta    beta;
+    CoeffR  x_r;
+    CoeffW  x_w;
+    CoeffK  x_k;
+    CoeffV  x_v;
+    CoeffA  x_a;
+    CoeffG  x_g;
+    OutR    o_r;
+    OutW    o_w;
+    OutK    o_k;
+    OutV    o_v;
+    OutA    o_a;
+    OutG    o_g;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint g                       = gl_WorkGroupID.x;
+    const uint index                   = gl_LocalInvocationIndex;
+    const uint subgroup_id             = gl_SubgroupID;
+    const uint subgroup_invocation_id  = gl_SubgroupInvocationID;
+
+    InputX  input_x = params.input_x;
+    State   state   = params.state;
+    Gamma   gamma   = params.gamma;
+    Beta    beta    = params.beta;
+    CoeffR  x_r     = params.x_r;
+    CoeffW  x_w     = params.x_w;
+    CoeffK  x_k     = params.x_k;
+    CoeffV  x_v     = params.x_v;
+    CoeffA  x_a     = params.x_a;
+    CoeffG  x_g     = params.x_g;
+    OutR    o_r     = params.o_r;
+    OutW    o_w     = params.o_w;
+    OutK    o_k     = params.o_k;
+    OutV    o_v     = params.o_v;
+    OutA    o_a     = params.o_a;
+    OutG    o_g     = params.o_g;
+
+    // Phase 1: 冗余归约 —— 每个 workgroup 独立对全 C 算 mean/inv_std（x 命中 L2，开销小）
+    float local_sum = 0.0;
+    float local_sq_sum = 0.0;
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        float value = input_x.data[i];
+        local_sum += value;
+        local_sq_sum += value * value;
+    }
+    local_sum = subgroupAdd(local_sum);
+    local_sq_sum = subgroupAdd(local_sq_sum);
+    if (subgroup_invocation_id == 0) {
+        sketch_sum[subgroup_id] = local_sum;
+        sketch_sq_sum[subgroup_id] = local_sq_sum;
+    }
+    barrier();
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sum[index] += sketch_sum[index + step];
+            sketch_sq_sum[index] += sketch_sq_sum[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        float sum = sketch_sum[0];
+        float sq_sum = sketch_sq_sum[0];
+        mean = sum / float(C);
+        float variance = sq_sum / float(C) - mean * mean;
+        inv_std = inversesqrt(variance + EPSILON);
+    }
+    barrier();
+
+    // Phase 2: apply 本 workgroup 负责的 C 片段（每个线程 1 个元素）
+    const uint start = g * BLOCK_SIZE;
+    const uint i     = start + index;
+    if (i < C) {
+        float val  = input_x.data[i];
+        float ln1  = (val - mean) * inv_std * gamma.data[i] + beta.data[i];
+        float prev = state.data[i];
+
+        o_r.data[i] = ln1 + x_r.data[i] * (prev - ln1);
+        o_w.data[i] = ln1 + x_w.data[i] * (prev - ln1);
+        o_k.data[i] = ln1 + x_k.data[i] * (prev - ln1);
+        o_v.data[i] = ln1 + x_v.data[i] * (prev - ln1);
+        o_a.data[i] = ln1 + x_a.data[i] * (prev - ln1);
+        o_g.data[i] = ln1 + x_g.data[i] * (prev - ln1);
+
+        state.data[i] = ln1;   // tmix_x = ln1
+    }
+}

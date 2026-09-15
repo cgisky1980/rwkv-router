@@ -1,0 +1,44 @@
+[package]
+name = "rwkv-router"
+version = "0.1.0"
+edition = "2021"
+description = "RWKV-Router: self-evolving smart router (R0-R3 tier classification + RWKV local inference stack), standalone component extracted from Ai00-X"
+license = "MIT"
+
+[workspace]
+# Standalone component workspace root. default-members keeps plain
+# `cargo test/build` on the Rust side; the Python cdylib joins via
+# `--workspace`/maturin (extension-module links only inside wheels).
+members = ["sidecar", "bindings/python", "bindings/node"]
+default-members = [".", "sidecar"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "rwkv_router"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Built-in RWKV engines (rwkv-rsv / Vulkan): 0.1B resident classifier +
+# tier generation pool. Optional so pure-logic consumers never pull the GPU
+# stack; the Ai00-X client uses the feature-less build (it runs its own
+# inference via `ClassifyEngine` injection).
+rwkv = ["dep:rwkv-rsv", "dep:fastrand"]
+# C ABI exports (cdylib) for arbitrary FFI languages (C#/Java/Lua/...).
+# Python/Node bindings use pyo3/napi directly instead.
+ffi = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+# 进化编排：hidden f16 存储（hex）与 eval/replay 包（base64）编解码。
+half = "2"
+base64 = "0.22"
+# Built-in engine sampling (same RNG crate as rwkv-rsv).
+fastrand = { version = "2.3", optional = true }
+rwkv-rsv = { path = "vendor/rwkv-rsv", optional = true }

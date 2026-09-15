@@ -1,0 +1,40 @@
+[package]
+name = "rwkv-rsv"
+version = "0.1.0"
+edition = "2024"
+
+# vendored Vulkan 库的可选 feature（未启用，仅为消除 unexpected_cfgs 警告）
+[features]
+serde = []
+rayon = ["dep:rayon"]
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+fastrand = "2.3"
+half = { version = "2.7", features = ["bytemuck"] }
+itertools = "0.14"
+libloading = "0.8"
+log = "0.4"
+memmap2 = "0.9"
+rayon = { version = "1.12", optional = true }
+rust-embed = { version = "8", features = ["include-exclude"] }
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+thiserror = "2.0"
+vulkanalia = { version = "0.34", features = ["libloading"] }
+
+[dependencies.derive_more]
+features = [
+    "as_ref",
+    "constructor",
+    "deref",
+    "deref_mut",
+    "display",
+    "from",
+    "into",
+]
+version = "2.1"

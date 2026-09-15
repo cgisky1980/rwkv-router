@@ -1,0 +1,103 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 深度融合：cmix 的 ln2 = layer_norm(x, ln2_w, ln2_b) + prev_c 读入 + state.cmix_x 写回 + lerp(xb)。
+// 单 token（batch=1, H=1）路径，一个 workgroup 完成原先 4 次 dispatch。
+//   ln2 = (x - mean) * inv_std * gamma + beta
+//   xb  = ln2 + ffn_x_k * (prev_c - ln2)      （prev_c = state.cmix_x 旧值）
+//   state.cmix_x = ln2
+// 输出只需 xb（xb 就是 cmix 的输入 x，参与后续 gemv）。
+
+layout(constant_id = 0) const uint C = 4096;    // Hidden size
+layout(constant_id = 1) const float EPSILON = 1e-5;
+
+const uint BLOCK_SIZE       = 256;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=2），不写死 32（AMD=64，Intel 可变）。
+layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS    = BLOCK_SIZE / SUBGROUP_SIZE;
+
+shared float sketch_sum[NUM_SUBGROUPS];
+shared float sketch_sq_sum[NUM_SUBGROUPS];
+shared float mean;
+shared float inv_std;
+
+layout(buffer_reference) buffer InputX  { float data[]; } input_x;
+layout(buffer_reference) buffer State   { float data[]; } state;   // prev_c 读 + cmix_x 写回
+layout(buffer_reference) buffer Gamma   { float data[]; } gamma;   // ln2_w
+layout(buffer_reference) buffer Beta    { float data[]; } beta;    // ln2_b
+layout(buffer_reference) buffer Coeff   { float data[]; } coeff;   // ffn_x_k
+layout(buffer_reference) buffer Out     { float data[]; } out_xb;  // xb
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InputX  input_x;
+    State   state;
+    Gamma   gamma;
+    Beta    beta;
+    Coeff   coeff;
+    Out     out_xb;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index                    = gl_LocalInvocationIndex;
+    const uint subgroup_id              = gl_SubgroupID;
+    const uint subgroup_invocation_id   = gl_SubgroupInvocationID;
+
+    InputX  input_x = params.input_x;
+    State   state   = params.state;
+    Gamma   gamma   = params.gamma;
+    Beta    beta    = params.beta;
+    Coeff   coeff   = params.coeff;
+    Out     out_xb  = params.out_xb;
+
+    // Phase 1: mean / var over x
+    float local_sum = 0.0;
+    float local_sq_sum = 0.0;
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        float value = input_x.data[i];
+        local_sum += value;
+        local_sq_sum += value * value;
+    }
+    local_sum = subgroupAdd(local_sum);
+    local_sq_sum = subgroupAdd(local_sq_sum);
+    if (subgroup_invocation_id == 0) {
+        sketch_sum[subgroup_id] = local_sum;
+        sketch_sq_sum[subgroup_id] = local_sq_sum;
+    }
+    barrier();
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_sum[index] += sketch_sum[index + step];
+            sketch_sq_sum[index] += sketch_sq_sum[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        float sum = sketch_sum[0];
+        float sq_sum = sketch_sq_sum[0];
+        mean = sum / float(C);
+        float variance = sq_sum / float(C) - mean * mean;
+        inv_std = inversesqrt(variance + EPSILON);
+    }
+    barrier();
+
+    // Phase 2: ln2 + lerp + state writeback
+    [[unroll]]
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        float val = input_x.data[i];
+        float ln2 = (val - mean) * inv_std * gamma.data[i] + beta.data[i];
+        float prev = state.data[i];
+        out_xb.data[i] = ln2 + coeff.data[i] * (prev - ln2);
+        state.data[i] = ln2;   // cmix_x = ln2
+    }
+}

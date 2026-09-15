@@ -1,0 +1,39 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 拷贝一个 token 行到 [C] 状态缓冲（sequence-parallel 状态更新用）。
+//   out_y[i] = in_x[TOKEN * STRIDE + i]
+// 单个 workgroup，线程循环 C 个通道。
+
+layout(constant_id = 0) const uint C = 4096;
+layout(constant_id = 1) const uint STRIDE = 4096;   // Token stride of in_x
+layout(constant_id = 2) const uint TOKEN = 0;       // Which token to copy (usually T-1)
+
+const uint BLOCK_SIZE = 256;
+
+layout(buffer_reference) buffer In  { float data[]; }  in_x;   // [T, C]
+layout(buffer_reference) buffer Out { float data[]; }  out_y;  // [C]
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    In  in_x;
+    Out out_y;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_LocalInvocationID.x;
+
+    In  in_x  = params.in_x;
+    Out out_y = params.out_y;
+
+    const uint base = TOKEN * STRIDE;
+
+    for (uint i = index; i < C; i += BLOCK_SIZE) {
+        out_y.data[i] = in_x.data[base + i];
+    }
+}

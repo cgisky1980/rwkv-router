@@ -1,0 +1,308 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// 深度融合（int8 版）：gemv_int8 r/k/v（三个 C×C 投影，int8 量化权重）
+// + lowrank_stage1（v1/w1/a1/g1 四个 mid 投影，fp32 权重）→ 1 次 dispatch。
+//   r = xr @ R^T；k = xk @ K^T；v = xv @ V^T        （int8 权重，f32 输入/输出/累加）
+//   v_mid = xv @ V1；w_mid = tanh(xw @ W1)；
+//   a_mid = xa @ A1；g_mid = xg @ G1                （fp32 权重）
+//
+// int8 格式（每矩阵 W[C, C] 行主序，K=C 为收缩维，group=128）：
+//   idx: uint8 [C, C]     每权重 1 字节（0..255），打包为 uint32 [C, C/4]
+//   sz:  uint32 [C, C/128] 每元素 = (scale: fp16 低16位 | zero: fp16 高16位)
+// 反量化：w[m,k] = scale[m,k/128] * idx[m,k] + zero[m,k/128]
+//
+// 相比 fp16 版 gemv_rkv_stage1：r/k/v 权重带宽降到 ~50%（1 byte/权重）。
+// C=2560 时每层 r/k/v 权重 39.3MB(fp16) → 19.7MB(int8)。
+//
+// 并行化（与 fp16/any4 版一致）：每个 workgroup 处理 ROWS=4 行 r/k/v，每线程一次
+// 加载 x（xr/xk/xv）后在内层 r 循环复用于全部 4 行。每 workgroup 先把 3 矩阵 × 4 行的
+// scale/zero 协作加载进 shared；主循环每线程每迭代每行每矩阵只读 1 个 uint32
+//（4 权重，4B vs fp16 的 16B）。
+// 要求 C % 128 == 0（group 整除）、C % ROWS == 0（C=2560 均满足）。
+//
+// dispatch (C/ROWS + VM + WM + AM + GM, 1, 1)：
+//   前 C/ROWS 个 workgroup 各算 ROWS 行 r/k/v（int8 权重）；
+//   后 VM+WM+AM+GM 个 workgroup 各算一个 mid 输出（fp32 权重）。
+
+layout(constant_id = 0) const uint C  = 2560; // 收缩维度
+layout(constant_id = 1) const uint VM = 64;   // v 链 mid 行数
+layout(constant_id = 2) const uint WM = 96;   // w 链 mid 行数
+layout(constant_id = 3) const uint AM = 96;   // a 链 mid 行数
+layout(constant_id = 4) const uint GM = 320;  // g 链 mid 行数
+
+const uint ROWS           = 4;    // 每 workgroup 处理的 r/k/v 行数（须整除 C）
+const uint BLOCK_SIZE     = 128;
+// 跨硬件自适应：SUBGROUP_SIZE 由 runtime 传入（constant_id=5），不能写死 32（AMD=64，Intel 可变）。
+// 要求 BLOCK_SIZE % SUBGROUP_SIZE == 0（128 % 32/64/16 均整除）。
+layout(constant_id = 5) const uint SUBGROUP_SIZE = 32;
+const uint NUM_SUBGROUPS  = BLOCK_SIZE / SUBGROUP_SIZE;
+const uint KV             = C / 4;    // 每行 uint32 idx 数（4 个 uint8 权重打包为 1 个 uint32）
+const uint KG             = C / 128;  // 每行 group 数（group=128）
+
+shared float sketch_dot[ROWS][3][NUM_SUBGROUPS]; // r/k/v 归约（每行一组）
+shared float sketch_mid[NUM_SUBGROUPS];          // mid 单累加器归约
+// 本组 3 矩阵 × ROWS 行的 scale/zero（解包为 f32 对）。
+// 下标 [0]=r / [1]=k / [2]=v。
+shared float s_scale[3][ROWS][KG];
+shared float s_zero[3][ROWS][KG];
+
+layout(buffer_reference) buffer InRIdx { uint data[]; }      in_r_idx; // int8 打包 [C,C/4]
+layout(buffer_reference) buffer InRSZ  { uint data[]; }      in_r_sz;  // uint32 [C,C/128]
+layout(buffer_reference) buffer InKIdx { uint data[]; }     in_k_idx;
+layout(buffer_reference) buffer InKSZ  { uint data[]; }     in_k_sz;
+layout(buffer_reference) buffer InVIdx { uint data[]; }     in_v_idx;
+layout(buffer_reference) buffer InVSZ  { uint data[]; }     in_v_sz;
+layout(buffer_reference) buffer InV1 { float data[]; }  in_v1;   // fp32 [VM,C]
+layout(buffer_reference) buffer InW1 { float data[]; }  in_w1;
+layout(buffer_reference) buffer InA1 { float data[]; }  in_a1;
+layout(buffer_reference) buffer InG1 { float data[]; }  in_g1;
+layout(buffer_reference) buffer InXR { vec4 data[]; }   in_xr;   // f32 [C]
+layout(buffer_reference) buffer InXK { vec4 data[]; }   in_xk;
+layout(buffer_reference) buffer InXV { vec4 data[]; }   in_xv;
+layout(buffer_reference) buffer InXW { float data[]; }  in_xw;
+layout(buffer_reference) buffer InXA { float data[]; }  in_xa;
+layout(buffer_reference) buffer InXG { float data[]; }  in_xg;
+layout(buffer_reference) buffer OutR { float data[]; }  out_r;
+layout(buffer_reference) buffer OutK { float data[]; }  out_k;
+layout(buffer_reference) buffer OutV { float16_t data[]; } out_v;
+layout(buffer_reference) buffer OutVm { float data[]; } out_vm;
+layout(buffer_reference) buffer OutWm { float data[]; } out_wm;
+layout(buffer_reference) buffer OutAm { float data[]; } out_am;
+layout(buffer_reference) buffer OutGm { float data[]; } out_gm;
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InRIdx in_r_idx;
+    InRSZ  in_r_sz;
+    InKIdx in_k_idx;
+    InKSZ  in_k_sz;
+    InVIdx in_v_idx;
+    InVSZ  in_v_sz;
+    InV1  in_v1;
+    InW1  in_w1;
+    InA1  in_a1;
+    InG1  in_g1;
+    InXR  in_xr;
+    InXK  in_xk;
+    InXV  in_xv;
+    InXW  in_xw;
+    InXA  in_xa;
+    InXG  in_xg;
+    OutR  out_r;
+    OutK  out_k;
+    OutV  out_v;
+    OutVm out_vm;
+    OutWm out_wm;
+    OutAm out_am;
+    OutGm out_gm;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint flat_idx     = gl_WorkGroupID.x;
+    const uint index        = gl_LocalInvocationIndex;
+    const uint subgroup_id  = gl_SubgroupID;
+    const uint sub_inv      = gl_SubgroupInvocationID;
+
+    // ===== 分支 1：前 C/ROWS 个 workgroup 算 r/k/v（int8 权重，f32 输入）=====
+    if (flat_idx < C / ROWS) {
+        const uint row_base = flat_idx * ROWS;
+        InRIdx r_idx = params.in_r_idx;
+        InRSZ  r_sz  = params.in_r_sz;
+        InKIdx k_idx = params.in_k_idx;
+        InKSZ  k_sz  = params.in_k_sz;
+        InVIdx v_idx = params.in_v_idx;
+        InVSZ  v_sz  = params.in_v_sz;
+        InXR   xr = params.in_xr;
+        InXK   xk = params.in_xk;
+        InXV   xv = params.in_xv;
+        OutR   orr = params.out_r;
+        OutK   ok  = params.out_k;
+        OutV   ov  = params.out_v;
+
+        // Phase 0: 协作加载 3 矩阵 × ROWS 行的 scale/zero 到 shared。
+        // 无 LUT，仅加载 scale/zero。
+        [[unroll]]
+        for (uint i = index; i < ROWS * KG; i += BLOCK_SIZE) {
+            const uint r   = i / KG;
+            const uint g   = i % KG;
+            const uint row = row_base + r;
+            const vec2 szr = unpackFloat2x16(r_sz.data[row * KG + g]);
+            const vec2 szk = unpackFloat2x16(k_sz.data[row * KG + g]);
+            const vec2 szv = unpackFloat2x16(v_sz.data[row * KG + g]);
+            s_scale[0][r][g] = szr.x;  s_zero[0][r][g] = szr.y;
+            s_scale[1][r][g] = szk.x;  s_zero[1][r][g] = szk.y;
+            s_scale[2][r][g] = szv.x;  s_zero[2][r][g] = szv.y;
+        }
+        barrier();
+
+        // Phase 1: 为 ROWS 行 × 3 矩阵各维护一个独立累加器，同一 K 循环内并行
+        // 读 3×ROWS 行权重 + 复用 X。同一 uint32 的 4 个权重必属同一 group
+        //（4 | 128），组号 g = k / 32（32 个 uint32/组）。
+        float acc_r[ROWS]; float acc_k[ROWS]; float acc_v[ROWS];
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) { acc_r[r] = 0.0; acc_k[r] = 0.0; acc_v[r] = 0.0; }
+
+        [[unroll]]
+        for (uint k = index; k < KV; k += BLOCK_SIZE) {
+            // x 一次加载，复用于全部 ROWS 行（关键：消除逐行的 x 重读）
+            vec4 xrv = xr.data[k];
+            vec4 xkv = xk.data[k];
+            vec4 xvv = xv.data[k];
+            const uint g = k / 32;
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                const uint irow = (row_base + r) * KV + k;
+                const uint pr = r_idx.data[irow];
+                const uint pk = k_idx.data[irow];
+                const uint pv = v_idx.data[irow];
+                // r 链：反量化 4 权重并点积
+                {
+                    const float sc = s_scale[0][r][g];
+                    const float zr = s_zero[0][r][g];
+                    acc_r[r] += (sc * float(pr & 0xFFu)           + zr) * xrv.x
+                              + (sc * float((pr >>  8) & 0xFFu)   + zr) * xrv.y
+                              + (sc * float((pr >> 16) & 0xFFu)   + zr) * xrv.z
+                              + (sc * float(pr >> 24)             + zr) * xrv.w;
+                }
+                // k 链
+                {
+                    const float sc = s_scale[1][r][g];
+                    const float zr = s_zero[1][r][g];
+                    acc_k[r] += (sc * float(pk & 0xFFu)           + zr) * xkv.x
+                              + (sc * float((pk >>  8) & 0xFFu)   + zr) * xkv.y
+                              + (sc * float((pk >> 16) & 0xFFu)   + zr) * xkv.z
+                              + (sc * float(pk >> 24)             + zr) * xkv.w;
+                }
+                // v 链
+                {
+                    const float sc = s_scale[2][r][g];
+                    const float zr = s_zero[2][r][g];
+                    acc_v[r] += (sc * float(pv & 0xFFu)           + zr) * xvv.x
+                              + (sc * float((pv >>  8) & 0xFFu)   + zr) * xvv.y
+                              + (sc * float((pv >> 16) & 0xFFu)   + zr) * xvv.z
+                              + (sc * float(pv >> 24)             + zr) * xvv.w;
+                }
+            }
+        }
+
+        // 跨线程归约：先 subgroup 求和，再对 NUM_SUBGROUPS 做 shared 树归约
+        [[unroll]]
+        for (uint r = 0; r < ROWS; r++) {
+            acc_r[r] = subgroupAdd(acc_r[r]);
+            acc_k[r] = subgroupAdd(acc_k[r]);
+            acc_v[r] = subgroupAdd(acc_v[r]);
+            if (sub_inv == 0) {
+                sketch_dot[r][0][subgroup_id] = acc_r[r];
+                sketch_dot[r][1][subgroup_id] = acc_k[r];
+                sketch_dot[r][2][subgroup_id] = acc_v[r];
+            }
+        }
+        barrier();
+        [[unroll]]
+        for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+            if (index < step) {
+                [[unroll]]
+                for (uint r = 0; r < ROWS; r++) {
+                    sketch_dot[r][0][index] += sketch_dot[r][0][index + step];
+                    sketch_dot[r][1][index] += sketch_dot[r][1][index + step];
+                    sketch_dot[r][2][index] += sketch_dot[r][2][index + step];
+                }
+            }
+            barrier();
+        }
+        if (index == 0) {
+            [[unroll]]
+            for (uint r = 0; r < ROWS; r++) {
+                const uint row = row_base + r;
+                orr.data[row] = sketch_dot[r][0][0];
+                ok.data[row]  = sketch_dot[r][1][0];
+                ov.data[row]  = float16_t(sketch_dot[r][2][0]);
+            }
+        }
+        return;
+    }
+
+    // ===== 分支 2：后 VM+WM+AM+GM 个 workgroup 算 mid 投影（fp32 权重）=====
+    const uint mid_idx = flat_idx - C / ROWS;
+    uint chain = 3;
+    uint row   = 0;
+    float local_dot = 0.0;
+
+    InXW xw = params.in_xw;
+    InXA xa = params.in_xa;
+    InXG xg = params.in_xg;
+    InXV xv = params.in_xv;
+    InV1 v1 = params.in_v1;
+    InW1 w1 = params.in_w1;
+    InA1 a1 = params.in_a1;
+    InG1 g1 = params.in_g1;
+    OutVm o_vm = params.out_vm;
+    OutWm o_wm = params.out_wm;
+    OutAm o_am = params.out_am;
+    OutGm o_gm = params.out_gm;
+
+    if (mid_idx < VM) {
+        chain = 0;
+        row = mid_idx;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += v1.data[row * C + k] * xv.data[k / 4][k % 4];
+        }
+    } else if (mid_idx < VM + WM) {
+        chain = 1;
+        row = mid_idx - VM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += w1.data[row * C + k] * xw.data[k];
+        }
+    } else if (mid_idx < VM + WM + AM) {
+        chain = 2;
+        row = mid_idx - VM - WM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += a1.data[row * C + k] * xa.data[k];
+        }
+    } else {
+        row = mid_idx - VM - WM - AM;
+        [[unroll]]
+        for (uint k = index; k < C; k += BLOCK_SIZE) {
+            local_dot += g1.data[row * C + k] * xg.data[k];
+        }
+    }
+
+    local_dot = subgroupAdd(local_dot);
+    if (sub_inv == 0) {
+        sketch_mid[subgroup_id] = local_dot;
+    }
+    barrier();
+    [[unroll]]
+    for (uint step = NUM_SUBGROUPS >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            sketch_mid[index] += sketch_mid[index + step];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        float result = sketch_mid[0];
+        if (chain == 0) {
+            o_vm.data[row] = result;
+        } else if (chain == 1) {
+            o_wm.data[row] = tanh(result);
+        } else if (chain == 2) {
+            o_am.data[row] = result;
+        } else {
+            o_gm.data[row] = result;
+        }
+    }
+    return;
+}

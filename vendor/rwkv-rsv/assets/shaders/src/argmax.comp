@@ -1,0 +1,73 @@
+#version 450 core
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// GPU argmax：在 logits [N] 中找最大值，输出其索引（uint，写入长度 1 的缓冲）。
+// 单 workgroup（dispatch (1,1,1)），BLOCK_SIZE=256 线程协作：
+//   每个线程沿 stride 扫描自己分到的元素，取局部最大；随后 shared 树归约取全局 argmax。
+// 平局时取更小索引（与 CPU 的严格大于 argmax 一致）。
+// 相比把 65536 个 f32 logits（256KB）下载到 CPU 再遍历，只回传 4 字节索引，省去每 token 的
+// 大块 device→host 传输与 CPU 遍历开销。
+
+layout(constant_id = 0) const uint N = 65536;  // logits 长度（vocab）
+
+const uint BLOCK_SIZE = 256;
+
+shared float shared_max[BLOCK_SIZE];
+shared uint  shared_idx[BLOCK_SIZE];
+
+layout(buffer_reference) buffer InLogits { float data[]; };
+layout(buffer_reference) buffer OutToken { uint data[]; };
+
+layout(set = 0, binding = 0, std430) uniform Params {
+    InLogits in_logits;
+    OutToken out_token;
+} params;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+
+    InLogits in_logits = params.in_logits;
+    OutToken out_token = params.out_token;
+
+    // 每个线程沿 stride 扫描，取局部最大（严格大于，平局取小索引）
+    float lm = -1e30;
+    uint  li = 0;
+    [[unroll]]
+    for (uint i = index; i < N; i += BLOCK_SIZE) {
+        float v = in_logits.data[i];
+        if (v > lm) {
+            lm = v;
+            li = i;
+        }
+    }
+    shared_max[index] = lm;
+    shared_idx[index] = li;
+    barrier();
+
+    // shared 树归约，平局取更小索引
+    [[unroll]]
+    for (uint step = BLOCK_SIZE >> 1; step > 0; step >>= 1) {
+        if (index < step) {
+            const float av = shared_max[index];
+            const uint  ai = shared_idx[index];
+            const float bv = shared_max[index + step];
+            const uint  bi = shared_idx[index + step];
+            if (bv > av || (bv == av && bi < ai)) {
+                shared_max[index] = bv;
+                shared_idx[index] = bi;
+            }
+        }
+        barrier();
+    }
+
+    if (index == 0) {
+        out_token.data[0] = shared_idx[0];
+    }
+}
