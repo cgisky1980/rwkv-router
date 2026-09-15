@@ -13,6 +13,15 @@ RWKV-Router 是 **斯坦福大学（Stanford University）& Together AI** 在 *I
 
 RWKV-Router 比论文更进一步：补上了论文静态路由器没有的**第三块**——完全本地、纯 Rust 的**自进化闭环**，让路由器从真实流量中持续变强。
 
+## 相关项目与生态
+
+- **[rwkv7-state-embedding](https://github.com/cgisky1980/rwkv7-state-embedding)** —— 本项目分类器的学术基础。该项目（附论文）系统研究了如何从 RWKV-7 内部状态（hidden state 与 WKV state）提取语义嵌入，证明在 hidden state 上做监督投影可达 **0.93 的任务分类准确率**。RWKV-Router 的 0.1B 分类头——mean-hidden 状态嵌入 + 可训练 MLP 头——正是这一方法的工程化落地。
+- **RWKV 官方**：
+  - 官网：<https://www.rwkv.com>
+  - GitHub 组织：<https://github.com/RWKV>
+  - 模型训练仓库：<https://github.com/BlinkDL/RWKV-LM>
+- **rwkv-rsv** —— 纯 Rust + Vulkan 推理运行时，以 `vendor/rwkv-rsv/` 内嵌于本仓库（常驻 0.1B 分类器 + 层级生成池）。
+
 ## 准确率
 
 | 阶段 | 标准评估集 | 说明 |

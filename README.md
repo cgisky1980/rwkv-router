@@ -13,6 +13,15 @@ RWKV-Router is a production-grade open-source implementation of the routing para
 
 RWKV-Router goes one step further than the paper: it adds a **third piece** the paper's static router lacks — a fully local, pure-Rust **self-evolution loop** that keeps improving the router from real traffic.
 
+## Related projects & ecosystem
+
+- **[rwkv7-state-embedding](https://github.com/cgisky1980/rwkv7-state-embedding)** — the research foundation of our classifier. That project (with its own paper) systematically studies extracting semantic embeddings from RWKV-7 internal states (hidden state & WKV state) and shows that a supervised projection on the hidden state reaches **0.93 task-classification accuracy**. The 0.1B classifier head in RWKV-Router — mean-hidden state embedding + trainable MLP head — is the engineering productization of exactly that method.
+- **RWKV official**:
+  - Website: <https://www.rwkv.com>
+  - GitHub org: <https://github.com/RWKV>
+  - Model training repo: <https://github.com/BlinkDL/RWKV-LM>
+- **rwkv-rsv** — the pure-Rust + Vulkan inference runtime embedded in this repo as `vendor/rwkv-rsv/` (resident 0.1B classifier + tier generation pool).
+
 ## Accuracy
 
 | Stage | Standard eval set | Notes |
