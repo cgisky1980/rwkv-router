@@ -35,7 +35,7 @@ RWKV-Router 比论文更进一步：补上了论文静态路由器没有的**第
   - 官网：<https://www.rwkv.com>
   - GitHub 组织：<https://github.com/RWKV>
   - 模型训练仓库：<https://github.com/BlinkDL/RWKV-LM>
-- **rwkv-rsv** —— 纯 Rust + Vulkan 推理运行时，以 `vendor/rwkv-rsv/` 内嵌于本仓库（常驻 0.1B 分类器 + 层级生成池）。
+- **rwkv-rsv** —— 纯 Rust 推理运行时（**Vulkan + CUDA 双后端**），以 `vendor/rwkv-rsv/` 内嵌于本仓库（常驻 0.1B 分类器 + 层级生成池）。
 
 ## 准确率
 
@@ -51,7 +51,7 @@ RWKV-Router 比论文更进一步：补上了论文静态路由器没有的**第
 - **R0–R3 四级路由**：每条请求先过规则栈（trivial-ack 短路 / 安全升级 / sticky 层级），再用常驻 RWKV 0.1B 做分类（mean-hidden 状态嵌入 + 可训练 MLP 头），输出层级 + 置信度决策。
 - **两种使用模式**（同一组件，配置决定）：
   - **仅路由 route-only**：输出 R0–R3 决策，生成交给宿主/外部端点；
-  - **全本地 local-stack**：R0/R1 → RWKV 小模型、R2 → 7B 级、R3 → 13B 级，内嵌 rwkv-rsv（Vulkan）推理，全离线。
+  - **全本地 local-stack**：R0/R1 → RWKV 小模型、R2 → 7B 级、R3 → 13B 级，内嵌 rwkv-rsv（Vulkan/CUDA）推理，全离线。
 - **自进化闭环（可自动进化，且进化不可致劣）**：真实路由时零成本捕获 `(文本, hidden, probs)` → 标注 → **纯 Rust AdamW 原位微调**（无 PyTorch 依赖）→ eval_pack 闸门（新头准确率不回退才上线）→ 备份 + 热部署。防遗忘设计：mean/std 冻结、低学习率、回放池按类均衡。
 - **五种发行形态**：Rust crate / C ABI 动态库 / Python 包（pyo3）/ Node 包（napi-rs）/ **本地智能路由网关单二进制**（CLI + HTTP + MCP）。
 
@@ -206,7 +206,7 @@ println!("tier = {}", decision.route);   // R0..R3
 
 默认 feature 是纯逻辑（零 tokio/GPU 依赖）；`rwkv` feature 启用内嵌 RWKV 推理（分类器 + LRU 分层生成池），`ffi` feature 启用 C ABI 导出。
 
-> 内嵌推理栈 `rwkv-rsv`（纯 Rust + Vulkan）以 **vendor** 方式随仓库分发（`vendor/rwkv-rsv/`，约 2.5MB）——克隆即构建，无需外部依赖；shader 以 committed `.spv` 回退，无 Vulkan SDK 也能编译（编辑 shader 源码则需要 `glslangValidator`）。
+> 内嵌推理栈 `rwkv-rsv`（纯 Rust，Vulkan + CUDA 双后端）以 **vendor** 方式随仓库分发（`vendor/rwkv-rsv/`，约 2.5MB）——克隆即构建，无需外部依赖；shader 以 committed `.spv` 回退，无 Vulkan SDK 也能编译（编辑 shader 源码则需要 `glslangValidator`）。
 
 ### Python（pyo3，PyPI 包名 `rwkv-router`）
 

@@ -35,7 +35,7 @@ In token terms: the paper shows **88.7%** of real queries can be answered locall
   - Website: <https://www.rwkv.com>
   - GitHub org: <https://github.com/RWKV>
   - Model training repo: <https://github.com/BlinkDL/RWKV-LM>
-- **rwkv-rsv** — the pure-Rust + Vulkan inference runtime embedded in this repo as `vendor/rwkv-rsv/` (resident 0.1B classifier + tier generation pool).
+- **rwkv-rsv** — the pure-Rust inference runtime embedded in this repo as `vendor/rwkv-rsv/` (resident 0.1B classifier + tier generation pool), with **Vulkan and CUDA** backends.
 
 ## Accuracy
 
@@ -51,7 +51,7 @@ The headline claim of this project is the second row: the shipped pretrained hea
 - **R0–R3 four-tier routing**: every request passes a rule stack first (trivial-ack short-circuit / safety escalation / sticky tiers), then a resident RWKV 0.1B classifier (mean-hidden state embedding + trainable MLP head) emits a tier + confidence decision.
 - **Two usage modes** (same component, config decides):
   - **Route-only**: return the R0–R3 decision; generation stays with the host / external endpoints;
-  - **Local-stack**: R0/R1 → small RWKV, R2 → 7B-class, R3 → 13B-class, embedded rwkv-rsv (Vulkan) inference — fully offline.
+  - **Local-stack**: R0/R1 → small RWKV, R2 → 7B-class, R3 → 13B-class, embedded rwkv-rsv (Vulkan/CUDA) inference — fully offline.
 - **Self-evolution loop (automatic, and provably non-regressing)**: real routing captures `(text, hidden, probs)` at zero cost → labeling → **pure-Rust AdamW in-place fine-tuning** (no PyTorch) → eval-pack gate (a new head ships only if accuracy does not regress) → backup + hot-reload. Forgetting is mitigated by frozen mean/std, low learning rate, and class-balanced replay.
 - **Five distribution forms**: Rust crate / C ABI dynamic library / Python package (pyo3) / Node package (napi-rs) / **local smart-routing gateway single binary** (CLI + HTTP + MCP).
 
@@ -208,7 +208,7 @@ println!("tier = {}", decision.route);   // R0..R3
 
 The default feature set is pure logic (zero tokio/GPU deps); the `rwkv` feature embeds RWKV inference (classifier + LRU tiered generation pool), `ffi` enables C ABI exports.
 
-> The embedded inference stack `rwkv-rsv` (pure Rust + Vulkan) is **vendored** into this repo (`vendor/rwkv-rsv/`, ~2.5MB) — clone and build with no external dependencies; shaders fall back to committed `.spv` binaries so no Vulkan SDK is needed to compile (editing shader sources requires `glslangValidator`).
+> The embedded inference stack `rwkv-rsv` (pure Rust; Vulkan + CUDA backends) is **vendored** into this repo (`vendor/rwkv-rsv/`, ~2.5MB) — clone and build with no external dependencies; shaders fall back to committed `.spv` binaries so no Vulkan SDK is needed to compile (editing shader sources requires `glslangValidator`).
 
 ### Python (pyo3, PyPI name `rwkv-router`)
 
